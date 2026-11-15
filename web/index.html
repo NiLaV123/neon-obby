@@ -38,12 +38,12 @@
 <div id="msg"></div>
 <div id="help">
   <kbd>WASD</kbd> move · <kbd>Space</kbd> jump · mouse / right‑drag look · wheel zoom<br>
-  <kbd>R</kbd> ray tracing on/off · <kbd>G</kbd> render scale · <kbd>K</kbd> respawn · <kbd>T</kbd> restart · <kbd>H</kbd> hide
+  <kbd>R</kbd> ray tracing on/off · <kbd>P</kbd> ReSTIR PT Enhanced on/off · <kbd>G</kbd> render scale · <kbd>K</kbd> respawn · <kbd>T</kbd> restart · <kbd>H</kbd> hide
 </div>
 
 <div class="overlay" id="start">
   <h1>NEON OBBY</h1>
-  <p>Ten stages over a lava sea. Rust → WebAssembly runs the physics and rebuilds a BVH every frame; WebGPU rasterizes a G‑buffer, then a compute pass ray traces shadows, AO, mirrors and glass.</p>
+  <p>Ten stages over a lava sea. Rust → WebAssembly runs the physics and rebuilds a BVH every frame; WebGPU rasterizes a G‑buffer, then compute passes path trace the whole scene with ReSTIR PT Enhanced (NVIDIA, 2026): hybrid‑shift path reuse, paired spatial reuse, duplication maps.</p>
   <button>PLAY</button>
 </div>
 
