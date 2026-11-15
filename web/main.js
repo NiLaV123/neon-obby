@@ -1,5 +1,6 @@
 import { RASTER_WGSL, TRACE_WGSL, PT_TEMPORAL_WGSL, PT_PREPASS_WGSL, PT_RESAMPLE_WGSL, PT_DUP_WGSL, DN_ACCUM_WGSL, DN_ATROUS_WGSL, SHADE_WGSL, POST_WGSL,
   SHADOW_WGSL, PROBE_TRACE_WGSL, PROBE_UPDATE_WGSL, AO_WGSL, AO_BLUR_WGSL, LIGHT_WGSL, TRANSPARENT_WGSL, BLOOM_DOWN_WGSL, BLOOM_UP_WGSL } from './shaders.js';
+import { SoundLibrary, MovementSounds } from './audio.js';
 
 const $ = (id) => document.getElementById(id);
 const canvas = $('c');
@@ -62,16 +63,31 @@ const scale3 = (a, k) => [a[0] * k, a[1] * k, a[2] * k];
 const cross3 = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
 const norm3 = (a) => { const l = Math.hypot(...a) || 1; return [a[0] / l, a[1] / l, a[2] / l]; };
 
-// ------------------------------------------------------------- audio blips
-let audio = null;
-function blip(freq, dur = 0.12, type = 'square', slide = 0, vol = 0.06) {
-  if (!audio) return;
-  const t = audio.currentTime, o = audio.createOscillator(), g = audio.createGain();
-  o.type = type; o.frequency.setValueAtTime(freq, t);
-  if (slide) o.frequency.exponentialRampToValueAtTime(freq * slide, t + dur);
-  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
-  o.connect(g).connect(audio.destination); o.start(t); o.stop(t + dur);
+// ------------------------------------------------------------- sound controls
+const sounds = new SoundLibrary();
+const movementSounds = new MovementSounds(sounds);
+function syncSoundControls() {
+  $('mute').textContent = sounds.muted ? 'Sound OFF' : 'Sound ON';
+  $('mute').setAttribute('aria-pressed', String(sounds.muted));
+  $('volume').value = Math.round(sounds.volume * 100);
 }
+function toggleSound() {
+  sounds.setMuted(!sounds.muted);
+  syncSoundControls();
+  if (!sounds.muted) void sounds.unlock().then(() => sounds.play('toggle'));
+}
+$('mute').addEventListener('click', toggleSound);
+$('volume').addEventListener('input', (e) => {
+  sounds.setVolume(Number(e.target.value) / 100);
+  syncSoundControls();
+  void sounds.unlock();
+});
+$('volume').addEventListener('change', () => sounds.play('toggle'));
+document.addEventListener('visibilitychange', () => {
+  sounds.setActive(!document.hidden);
+  movementSounds.reset();
+});
+syncSoundControls();
 
 function fail(msg) {
   $('err').textContent = msg;
@@ -492,20 +508,27 @@ async function main() {
   const SCALES = [1, 0.75, 0.5];
   let scaleIdx = 1; // default 75%: ReSTIR PT Enhanced runs at full render resolution
   addEventListener('keydown', (e) => {
+    // Leave native keyboard interaction intact on the audio controls.
+    if (e.target.closest?.('#audio-controls') && ['Space', 'Enter', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'].includes(e.code)) return;
+    if (e.target.closest?.('button') && ['Space', 'Enter'].includes(e.code)) return;
+    if (playing) void sounds.unlock();
     keys.add(e.code);
     if (e.code === 'Space') e.preventDefault();
     if (e.repeat) return;
     if (e.code === 'KeyR') { rtOn = !rtOn; clearPT = true; flashMsg(rtOn ? (ptOn ? 'ReSTIR PT Enhanced' : 'Hybrid ray tracing') : 'Raster lighting: probes + lights + shadow maps'); }
     if (e.code === 'KeyP') { ptOn = !ptOn; clearPT = true; flashMsg(ptOn ? 'ReSTIR PT Enhanced ON' : 'Hybrid RT: traced shadows + reflections, probe GI, lights'); }
     if (e.code === 'KeyG') { scaleIdx = (scaleIdx + 1) % SCALES.length; renderScale = SCALES[scaleIdx]; flashMsg(`Render scale ${Math.round(renderScale * 100)}%`); }
-    if (e.code === 'KeyK') w.respawn();
-    if (e.code === 'KeyT') { w.restart(); $('win').style.display = 'none'; }
+    if (e.code === 'KeyK') { w.respawn(); movementSounds.reset(); if (playing) sounds.play('respawn'); }
+    if (e.code === 'KeyT') { w.restart(); movementSounds.reset(); if (playing) sounds.play('restart'); $('win').style.display = 'none'; }
     if (e.code === 'KeyH') $('help').classList.toggle('hidden');
+    if (e.code === 'KeyM') toggleSound();
+    if (playing && ['KeyR', 'KeyP', 'KeyG', 'KeyH'].includes(e.code)) sounds.play('toggle');
   });
   addEventListener('keyup', (e) => keys.delete(e.code));
-  addEventListener('blur', () => keys.clear());
+  addEventListener('blur', () => { keys.clear(); sounds.stopAll(); movementSounds.reset(); });
   canvas.addEventListener('contextmenu', (e) => e.preventDefault());
   canvas.addEventListener('mousedown', (e) => {
+    if (playing) void sounds.unlock();
     if (e.button === 2) dragging = true;
     else if (playing && document.pointerLockElement !== canvas) canvas.requestPointerLock?.();
   });
@@ -517,10 +540,12 @@ async function main() {
     }
   });
   canvas.addEventListener('wheel', (e) => { e.preventDefault(); dist = Math.min(45, Math.max(4, dist * Math.exp(e.deltaY * 0.001))); }, { passive: false });
-  $('start').addEventListener('click', () => {
+  $('start').querySelector('button').addEventListener('click', () => {
+    w.start();
     playing = true;
     $('start').style.display = 'none';
-    try { audio = audio || new AudioContext(); } catch { /* no audio */ }
+    movementSounds.reset();
+    void sounds.unlock().then(() => sounds.play('start'));
     canvas.requestPointerLock?.();
   });
 
@@ -555,11 +580,20 @@ async function main() {
     const out = new Float32Array(mem, w.out_ptr(), 32);
     const eye = [out[0], out[1], out[2]], target = [out[3], out[4], out[5]];
     const ev = out[13];
-    if (ev & 1) { blip(660, 0.1, 'square', 1.5); setTimeout(() => blip(990, 0.15, 'square', 1.3), 90); flashMsg(`Checkpoint! Stage ${out[9]}`); }
-    if (ev & 2) { blip(220, 0.35, 'sawtooth', 0.3, 0.08); flash = 1; }
-    if (ev & 4) { [523, 659, 784, 1046].forEach((f, i) => setTimeout(() => blip(f, 0.25, 'triangle', 1, 0.08), i * 120)); $('win').style.display = 'flex'; $('wintime').textContent = fmtTime(out[12]); $('windeaths').textContent = out[11]; }
-    if (ev & 8) blip(420, 0.09, 'square', 1.6, 0.03);
-    if (ev & 16) blip(200, 0.3, 'sine', 4, 0.09);
+    if (ev & 1) flashMsg(`Checkpoint! Stage ${out[9]}`);
+    if (ev & 2) flash = 1;
+    if (ev & 4) { $('win').style.display = 'flex'; $('wintime').textContent = fmtTime(out[12]); $('windeaths').textContent = out[11]; }
+    if (playing) {
+      // Death/win take priority over incidental sounds from the same physics frame.
+      if (ev & 2) sounds.play('death');
+      else if (ev & 4) sounds.play('win');
+      else {
+        if (ev & 1) sounds.play('checkpoint');
+        if (ev & 8) sounds.play('jump');
+        if (ev & 16) sounds.play('bounce');
+      }
+      if (!out[14]) movementSounds.update({ x: out[6], z: out[8], grounded: Boolean(out[15]), moving: Boolean(mx || mz), events: ev }, dt);
+    }
 
     const nb = w.box_count(), nn = w.node_count(), np = w.prim_count();
     device.queue.writeBuffer(boxBuf, 0, mem, w.boxes_ptr(), nb * 64);

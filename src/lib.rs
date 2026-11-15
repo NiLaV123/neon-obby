@@ -524,6 +524,7 @@ struct Game {
     spawn: V3,
     stage: i32,
     deaths: u32,
+    started: bool,
     won: bool,
     run_time: f32,
     events: u32,
@@ -559,6 +560,7 @@ impl Game {
             spawn: v3(0.0, 0.2, 0.0),
             stage: 0,
             deaths: 0,
+            started: false,
             won: false,
             run_time: 0.0,
             events: 0,
@@ -583,6 +585,10 @@ impl Game {
         self.ground = None;
         self.grounded = false;
         self.facing = 0.0;
+    }
+
+    fn start(&mut self) {
+        self.started = true;
     }
 
     fn restart(&mut self) {
@@ -692,7 +698,7 @@ impl Game {
         let dt = dt.clamp(0.0, 0.05);
         self.events = 0;
         self.time += dt;
-        if !self.won {
+        if self.started && !self.won {
             self.run_time += dt;
         }
         self.update_parts(dt);
@@ -1011,6 +1017,12 @@ fn g() -> &'static mut Game {
 pub extern "C" fn init() {
     unsafe { GAME = Some(Game::new()) };
 }
+
+/// Begin timing the run after the title screen is dismissed.
+#[no_mangle]
+pub extern "C" fn start() {
+    g().start();
+}
 #[no_mangle]
 pub extern "C" fn frame(dt: f32, mx: f32, mz: f32, jump: u32, yaw: f32, pitch: f32, dist: f32) {
     g().frame(dt, mx, mz, jump != 0, yaw, pitch, dist);
@@ -1058,4 +1070,64 @@ pub extern "C" fn lights_ptr() -> *const GpuLight {
 #[no_mangle]
 pub extern "C" fn light_count() -> u32 {
     g().lights.len() as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn idle_frame(game: &mut Game) {
+        game.frame(1.0 / 60.0, 0.0, 0.0, false, PI, 0.3, 18.0);
+    }
+
+    #[test]
+    fn title_screen_animates_without_timing_the_run() {
+        let mut game = Game::new();
+        for _ in 0..60 {
+            idle_frame(&mut game);
+        }
+        assert!(game.time > 0.9);
+        assert!(!game.boxes.is_empty());
+        assert_eq!(game.out[12], 0.0);
+
+        game.start();
+        idle_frame(&mut game);
+        assert!((game.out[12] - 1.0 / 60.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn starting_again_and_respawning_preserve_elapsed_time() {
+        let mut game = Game::new();
+        game.start();
+        idle_frame(&mut game);
+        let elapsed = game.out[12];
+        game.start();
+        game.respawn();
+        idle_frame(&mut game);
+        assert!((game.out[12] - elapsed * 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn restart_before_play_keeps_the_timer_stopped() {
+        let mut game = Game::new();
+        game.restart();
+        idle_frame(&mut game);
+        assert_eq!(game.out[12], 0.0);
+    }
+
+    #[test]
+    fn winning_stops_the_timer_and_restart_begins_a_new_run() {
+        let mut game = Game::new();
+        game.start();
+        idle_frame(&mut game);
+        let elapsed = game.out[12];
+        game.won = true;
+        idle_frame(&mut game);
+        assert_eq!(game.out[12], elapsed);
+
+        game.restart();
+        assert_eq!(game.run_time, 0.0);
+        idle_frame(&mut game);
+        assert!((game.out[12] - 1.0 / 60.0).abs() < 1e-6);
+    }
 }

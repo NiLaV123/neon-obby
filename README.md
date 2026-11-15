@@ -29,7 +29,14 @@ A Roblox-style obstacle course running in the browser, with three renderers: a p
 Needs a WebGPU browser (Chrome/Edge, Safari 26+).
 
 ## Controls
-`WASD` move · `Space` jump · mouse / right-drag look · wheel zoom · `R` raster lighting ↔ ray tracing · `P` (in ray tracing) ReSTIR PT Enhanced ↔ hybrid · `G` render scale · `K` respawn · `T` restart · `H` hide help
+`WASD` move · `Space` jump · mouse / right-drag look · wheel zoom · `R` raster lighting ↔ ray tracing · `P` (in ray tracing) ReSTIR PT Enhanced ↔ hybrid · `G` render scale · `K` respawn · `T` restart · `M` mute · `H` hide help
+
+## Sound
+Eleven original Web Audio effects cover starting, jumping, landing, footsteps, bounce pads, checkpoints, death, respawning, restarting, UI changes, and winning. Layered tones and filtered noise are synthesized locally; no sound files or external services are needed. Footsteps vary in pitch and alternate subtly between left and right, while landing volume follows time spent airborne.
+
+Use the sound button or `M` to mute, and the volume slider to adjust the mix. Both settings are saved in your browser. Audio starts after interaction and pauses when the tab is hidden.
+
+Effect definitions live in `web/audio.js`: add a named array of tone/noise layers to `SOUND_LIBRARY`, then call `sounds.play(name)`. Each layer supports a delay (`at`), duration, gain, and either oscillator frequency/type/pitch sweep or a noise filter cutoff. Melodies use the audio clock to stay in time during slow frames.
 
 ## Build
 ```sh
@@ -38,3 +45,12 @@ rustup target add wasm32-unknown-unknown
 python3 -m http.server -d web 8080
 ```
 Pushing to `main` builds and deploys to GitHub Pages via `.github/workflows/pages.yml`.
+
+## Checks
+```sh
+cargo test --locked
+node --test tools/audio.test.mjs
+./build.sh
+node tools/sim.mjs web/obby.wasm
+```
+The run timer starts when PLAY is clicked. The checks cover this lifecycle in Rust and through the WebAssembly API.
