@@ -121,6 +121,25 @@ pub struct GpuBox {
     refl: f32,
 }
 
+/// Must match `struct Light` in WGSL (32 bytes): position, range, colour * intensity.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct GpuLight {
+    p: [f32; 3],
+    radius: f32,
+    col: [f32; 3],
+    pad: f32,
+}
+
+/// A hand-placed local light, optionally attached to a part so it follows its motion.
+struct LightDef {
+    part: Option<usize>,
+    off: V3,
+    col: V3,
+    intensity: f32,
+    radius: f32,
+}
+
 /// Must match `struct Node` in WGSL (32 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -213,6 +232,7 @@ fn pal(i: usize) -> V3 {
 
 struct Builder {
     parts: Vec<Part>,
+    lights: Vec<LightDef>,
     stage: i32,
 }
 
@@ -253,10 +273,20 @@ impl Builder {
         self.stage += 1;
         let i = self.add(c + v3(0.0, 0.1, 0.0), v3(5.0, 0.2, 5.0), CP_COL, CHECKPOINT, SOLID | CHECK);
         self.parts[i].stage = self.stage;
+        self.light(Some(i), v3(0.0, 1.2, 0.0), v3(0.35, 0.65, 1.0), 2.5, 7.0);
         near_z + 12.0
     }
     fn motion(&mut self, i: usize, m: Motion) {
         self.parts[i].motion = m;
+    }
+    /// Hand-placed light. `part`: follow that part (offset in its local frame), else world space.
+    fn light(&mut self, part: Option<usize>, off: V3, col: V3, intensity: f32, radius: f32) {
+        self.lights.push(LightDef { part, off, col, intensity, radius });
+    }
+    /// Glow light hugging an emissive hazard / pad.
+    fn glow(&mut self, part: usize, intensity: f32, radius: f32) {
+        let col = self.parts[part].col;
+        self.light(Some(part), V3::default(), col, intensity, radius);
     }
 }
 
@@ -266,8 +296,8 @@ const FONT: [(char, [&str; 5]); 3] = [
     ('Y', ["#...#", ".#.#.", "..#..", "..#..", "..#.."]),
 ];
 
-fn build_level() -> (Vec<Part>, i32) {
-    let mut b = Builder { parts: Vec::new(), stage: 0 };
+fn build_level() -> (Vec<Part>, Vec<LightDef>, i32) {
+    let mut b = Builder { parts: Vec::new(), lights: Vec::new(), stage: 0 };
 
     // lava sea + spawn baseplate
     let lava = b.add(v3(0.0, -16.0, 220.0), v3(1400.0, 2.0, 1400.0), v3(1.0, 0.32, 0.06), NEON, KILL);
@@ -280,13 +310,18 @@ fn build_level() -> (Vec<Part>, i32) {
     b.add(v3(-20.0, 7.0, -2.0), v3(1.0, 14.0, 26.0), v3(0.92, 0.94, 0.98), METAL, SOLID);
     b.add(v3(-19.0, 0.5, -2.0), v3(1.0, 1.0, 26.0), v3(0.2, 0.2, 0.22), SMOOTH, SOLID);
     b.add(v3(13.0, 3.0, -10.0), v3(6.0, 6.0, 6.0), v3(0.55, 0.85, 1.0), GLASS, SOLID);
+    b.light(None, v3(13.0, 3.0, -6.0), v3(0.45, 0.85, 1.0), 6.0, 12.0);
     b.add(v3(13.0, 0.05, 8.0), v3(14.0, 0.1, 14.0), v3(0.06, 0.06, 0.08), POLISHED, SOLID);
     for i in 0..5 {
         let h = 2.0 + i as f32 * 2.0;
         b.add(v3(-12.0 + i as f32 * 4.0, h * 0.5, -18.0), v3(2.0, h, 2.0), pal(i), PLASTIC, SOLID);
     }
+    // uplights washing the pillars
+    b.light(None, v3(-10.0, 1.5, -16.0), v3(1.0, 0.45, 0.25), 4.0, 8.0);
+    b.light(None, v3(-2.0, 1.5, -16.0), v3(0.35, 0.55, 1.0), 4.0, 8.0);
     let tb = b.add(v3(13.0, 7.0, 8.0), v3(2.0, 2.0, 2.0), GOLD, METAL, 0);
     b.motion(tb, Motion::Spin { axis: v3(0.3, 1.0, 0.2) * (1.0 / 1.063), speed: 1.2, phase: 0.0 });
+    b.light(None, v3(13.0, 4.5, 8.0), v3(1.0, 0.8, 0.5), 5.0, 10.0);
 
     // neon "OBBY" sign over the start of the course (reads correctly from spawn)
     let px = 1.4;
@@ -294,6 +329,8 @@ fn build_level() -> (Vec<Part>, i32) {
     let width = (word.len() * 6 - 1) as f32 * px;
     let x0 = width * 0.5;
     for (li, ch) in word.chars().enumerate() {
+        let lx = x0 - (li * 6 + 2) as f32 * px;
+        b.light(None, v3(lx, 22.0 - 2.0 * px, 31.5), pal(li * 2 + 7), 22.0, 16.0);
         let rows = FONT.iter().find(|f| f.0 == ch).unwrap().1;
         for (r, row) in rows.iter().enumerate() {
             for (cc, bit) in row.chars().enumerate() {
@@ -325,7 +362,8 @@ fn build_level() -> (Vec<Part>, i32) {
     b.plat(v3(0.0, y, start + len * 0.5), 6.0, len, pal(6));
     for k in 0..6 {
         let hgt = if k % 2 == 0 { 0.8 } else { 1.6 };
-        b.add(v3(0.0, y + hgt * 0.5, start + 6.0 + 6.0 * k as f32), v3(6.4, hgt, 1.0), LAVA, NEON, KILL);
+        let i = b.add(v3(0.0, y + hgt * 0.5, start + 6.0 + 6.0 * k as f32), v3(6.4, hgt, 1.0), LAVA, NEON, KILL);
+        b.glow(i, 6.0, 7.0);
     }
     z = b.checkpoint(start + len + 3.0, y);
 
@@ -344,6 +382,9 @@ fn build_level() -> (Vec<Part>, i32) {
         for j in 0..=k {
             let i = b.add(c + v3(0.0, 0.6, 0.0), v3(17.0, 1.0, 1.0), LAVA, NEON, KILL);
             b.motion(i, Motion::Spin { axis: V3::Y, speed: 1.5 + 0.5 * k as f32, phase: j as f32 * PI * 0.5 });
+            // two lights along the bar so the sweep reads on the floor
+            b.light(Some(i), v3(5.0, 0.0, 0.0), LAVA, 6.0, 7.0);
+            b.light(Some(i), v3(-5.0, 0.0, 0.0), LAVA, 6.0, 7.0);
         }
         cz = c.z;
     }
@@ -378,6 +419,9 @@ fn build_level() -> (Vec<Part>, i32) {
         b.add(v3(x, y - 0.25, cz), v3(4.0, 0.5, 4.0), v3(0.6, 0.9, 1.0), GLASS, SOLID);
     }
     let end = cz + 5.0;
+    for i in 0..3 {
+        b.light(None, v3(0.0, y - 3.0, start + 8.0 + 14.0 * i as f32), v3(0.4, 0.75, 1.0), 10.0, 12.0);
+    }
     for s in [-1.0f32, 1.0] {
         b.add(v3(s * 10.0, y + 4.0, (start + end) * 0.5), v3(1.0, 16.0, end - start), v3(0.9, 0.93, 0.97), METAL, SOLID);
     }
@@ -386,7 +430,8 @@ fn build_level() -> (Vec<Part>, i32) {
     // 8: jump pad up to a high ledge
     let c = v3(0.0, y, z + 7.0);
     b.plat(c, 8.0, 8.0, pal(1));
-    b.add(c + v3(0.0, 0.2, 0.0), v3(4.0, 0.4, 4.0), v3(0.2, 1.0, 0.35), NEON, SOLID | BOUNCE);
+    let pad = b.add(c + v3(0.0, 0.2, 0.0), v3(4.0, 0.4, 4.0), v3(0.2, 1.0, 0.35), NEON, SOLID | BOUNCE);
+    b.light(Some(pad), v3(0.0, 1.5, 0.0), v3(0.2, 1.0, 0.35), 8.0, 10.0);
     y += 18.0;
     b.plat(v3(0.0, y, c.z + 12.0), 10.0, 10.0, pal(3));
     z = b.checkpoint(c.z + 20.0, y);
@@ -407,10 +452,12 @@ fn build_level() -> (Vec<Part>, i32) {
     for off in [10.0, 26.0] {
         let i = b.add(v3(0.0, y + 0.6, start + off), v3(7.0, 1.0, 1.0), LAVA, NEON, KILL);
         b.motion(i, Motion::Spin { axis: V3::Y, speed: 2.4, phase: off });
+        b.glow(i, 6.0, 7.0);
     }
     for off in [18.0, 34.0] {
         let i = b.add(v3(0.0, y + 1.25, start + off), v3(2.5, 2.5, 2.5), LAVA, NEON, KILL);
         b.motion(i, Motion::Slide { dir: v3(1.0, 0.0, 0.0), amp: 3.5, speed: 2.0, phase: off });
+        b.glow(i, 6.0, 7.0);
     }
 
     // win platform + trophy + arch
@@ -426,7 +473,10 @@ fn build_level() -> (Vec<Part>, i32) {
         b.add(t + v3(s * 2.0, 5.2, 0.0), v3(0.8, 1.6, 0.6), GOLD, METAL, SOLID);
         b.add(c + v3(s * 6.0, 5.0, -6.0), v3(1.0, 10.0, 1.0), v3(0.95, 0.95, 0.95), PLASTIC, SOLID);
     }
-    b.add(c + v3(0.0, 10.5, -6.0), v3(13.0, 1.0, 1.0), GOLD, NEON, 0);
+    let arch = b.add(c + v3(0.0, 10.5, -6.0), v3(13.0, 1.0, 1.0), GOLD, NEON, 0);
+    b.light(Some(arch), v3(-4.0, -1.0, 0.5), GOLD, 10.0, 13.0);
+    b.light(Some(arch), v3(4.0, -1.0, 0.5), GOLD, 10.0, 13.0);
+    b.light(None, t + v3(0.0, 5.0, -3.5), v3(1.0, 0.85, 0.6), 8.0, 9.0);
 
     // clouds
     let mut seed = 1234567u32;
@@ -451,7 +501,7 @@ fn build_level() -> (Vec<Part>, i32) {
     }
 
     let stages = b.stage;
-    (b.parts, stages)
+    (b.parts, b.lights, stages)
 }
 
 // ---------------------------------------------------------------- game
@@ -480,6 +530,8 @@ struct Game {
     jump_held: bool,
 
     boxes: Vec<GpuBox>,
+    light_defs: Vec<LightDef>,
+    lights: Vec<GpuLight>,
     aabbs: Vec<(V3, V3)>,
     nodes: Vec<Node>,
     prims: Vec<u32>,
@@ -488,9 +540,11 @@ struct Game {
 
 impl Game {
     fn new() -> Game {
-        let (parts, num_stages) = build_level();
+        let (parts, light_defs, num_stages) = build_level();
         let mut g = Game {
             parts,
+            lights: Vec::with_capacity(light_defs.len()),
+            light_defs,
             num_stages,
             time: 0.0,
             pos: V3::default(),
@@ -793,7 +847,26 @@ impl Game {
         best
     }
 
+    fn build_lights(&mut self) {
+        self.lights.clear();
+        for l in &self.light_defs {
+            let (p, on) = match l.part {
+                Some(i) => {
+                    let part = &self.parts[i];
+                    (part.c + qrot(part.q, l.off), part.active)
+                }
+                None => (l.off, true),
+            };
+            if !on {
+                continue;
+            }
+            let c = l.col * l.intensity;
+            self.lights.push(GpuLight { p: p.arr(), radius: l.radius, col: c.arr(), pad: 0.0 });
+        }
+    }
+
     fn build_boxes(&mut self) {
+        self.build_lights();
         self.boxes.clear();
         for p in &self.parts {
             let mut mat = p.mat;
@@ -977,4 +1050,12 @@ pub extern "C" fn prims_ptr() -> *const u32 {
 #[no_mangle]
 pub extern "C" fn prim_count() -> u32 {
     g().prims.len() as u32
+}
+#[no_mangle]
+pub extern "C" fn lights_ptr() -> *const GpuLight {
+    g().lights.as_ptr()
+}
+#[no_mangle]
+pub extern "C" fn light_count() -> u32 {
+    g().lights.len() as u32
 }

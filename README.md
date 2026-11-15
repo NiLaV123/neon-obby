@@ -1,9 +1,17 @@
 # Neon Obby
 
-A Roblox-style obstacle course with a hybrid **raster + ray traced** renderer, running in the browser.
+A Roblox-style obstacle course running in the browser, with three renderers: a production-style **raster lighting** pipeline (default), **hybrid ray tracing**, and **ReSTIR PT Enhanced** path tracing.
 
 - **Rust → WebAssembly** game core (no wasm-bindgen): level, physics, R6-style character rig, and a BVH rebuilt every frame.
-- **WebGPU** renderer:
+- **Raster lighting** (default; how a shipped game lights a scene — no per-pixel ray tracing):
+  - **Hand-placed lights**: 40 point lights authored in the Rust level (neon letters, hazard glows that ride on spinners and sliders, checkpoint pads, uplights, under-glass fills, the win arch), with **tiled light culling** (8×8 tiles, world-space tile bounds reduced in shared memory).
+  - **Cascaded shadow maps**: 3 × 2048² sun cascades fitted to frustum slices and texel-snapped, with **PCSS** contact-hardening soft shadows (blocker search + rotated 16-tap Poisson PCF).
+  - **DDGI irradiance probes**: a 24×12×32 grid (3-stud spacing) that scrolls with the player using toroidal addressing; half of the probes trace 48 rays per frame through the BVH (sun, local lights, emission and last frame's probes → infinite bounces), blended into 8×8 octahedral irradiance and 16×16 depth-moment maps with hysteresis; Chebyshev visibility and backface weights stop leaks, probes stuck inside geometry are switched off.
+  - **AO**: half-resolution horizon-based ambient occlusion with a depth-aware upsampling blur, applied with multi-bounce AO and specular occlusion.
+  - **Shading**: GGX specular per material (plastic, smooth, polished, metal), split-sum environment BRDF, **screen-space reflections** from last frame's image over a probe/sky fallback (sky visibility from the probe depth maps).
+  - **Forward transparency** for glass and blinking ghost blocks (Fresnel, sun glint, probe-lit body).
+  - **Procedural animated lava** (domain-warped crust with glowing, pulsing cracks), emissive treatment of neon, exponential **height fog** with sun in-scattering, 6-level **dual-filter bloom**, hand-tuned exposure and grade.
+- **WebGPU** ray-traced modes (`R`):
   1. Raster pass → G-buffer (albedo with procedural studs, normal + box id, reversed-Z depth)
   2. Trace pass (compute) → 1 spp soft sun shadow + AO rays through the BVH
   3. **ReSTIR PT Enhanced** ([Lin, Kettunen, Wyman 2026](https://research.nvidia.com/labs/rtr/publication/lin2026restirptenhanced/)) at full render resolution, 4 compute passes:
@@ -14,13 +22,14 @@ A Roblox-style obstacle course with a hybrid **raster + ray traced** renderer, r
      Shifts are the hybrid shift: random replay with stored seed + forced lobes up to the reconnection vertex chosen by the dual ray-footprint criterion (c = 0.02) + roughness test, with invertibility checks; NEE light vertices are forced reconnections.
      Its output goes through an **SVGF-style denoiser** (2 + 5 compute passes): albedo demodulation, reprojected temporal accumulation of illumination and luminance moments (variance), a neighbourhood clamp against ghosting from moving objects, then a 5-level edge-aware à-trous wavelet filter (normal, surface-plane and variance-scaled luminance edge-stops), re-modulated by albedo in the shade pass.
      In PT mode the internal resolution is capped to ~960×540 (software BVH rays are expensive without RT cores).
-     Not implemented from the paper: dual motion vectors, light tiles (one sun, so unnecessary), stream compaction of replays.  4. Shade pass (compute) → temporal accumulation with variance clamping, GI upsample, traced mirror/metal reflections and glass transmission
+     Not implemented from the paper: dual motion vectors, light tiles (one sun, so unnecessary), stream compaction of replays.
+  4. Shade pass (compute) → temporal accumulation with variance clamping, GI upsample, traced mirror/metal reflections and glass transmission
   5. Post → ACES tonemap
 
 Needs a WebGPU browser (Chrome/Edge, Safari 26+).
 
 ## Controls
-`WASD` move · `Space` jump · mouse / right-drag look · wheel zoom · `R` toggle ray tracing · `P` toggle ReSTIR PT Enhanced · `G` render scale · `K` respawn · `T` restart · `H` hide help
+`WASD` move · `Space` jump · mouse / right-drag look · wheel zoom · `R` raster lighting ↔ ray tracing · `P` (in ray tracing) ReSTIR PT Enhanced ↔ hybrid · `G` render scale · `K` respawn · `T` restart · `H` hide help
 
 ## Build
 ```sh

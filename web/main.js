@@ -1,4 +1,5 @@
-import { RASTER_WGSL, TRACE_WGSL, PT_TEMPORAL_WGSL, PT_PREPASS_WGSL, PT_RESAMPLE_WGSL, PT_DUP_WGSL, DN_ACCUM_WGSL, DN_ATROUS_WGSL, SHADE_WGSL, POST_WGSL } from './shaders.js';
+import { RASTER_WGSL, TRACE_WGSL, PT_TEMPORAL_WGSL, PT_PREPASS_WGSL, PT_RESAMPLE_WGSL, PT_DUP_WGSL, DN_ACCUM_WGSL, DN_ATROUS_WGSL, SHADE_WGSL, POST_WGSL,
+  SHADOW_WGSL, PROBE_TRACE_WGSL, PROBE_UPDATE_WGSL, AO_WGSL, AO_BLUR_WGSL, LIGHT_WGSL, TRANSPARENT_WGSL, BLOOM_DOWN_WGSL, BLOOM_UP_WGSL } from './shaders.js';
 
 const $ = (id) => document.getElementById(id);
 const canvas = $('c');
@@ -16,6 +17,12 @@ const m4 = {
   persp(fovy, aspect, near) {
     const f = 1 / Math.tan(fovy / 2), o = new Float32Array(16);
     o[0] = f / aspect; o[5] = f; o[11] = -1; o[14] = near;
+    return o;
+  },
+  // orthographic, WebGPU depth 0..1 (sun shadow maps)
+  ortho(r, near, far) {
+    const o = new Float32Array(16);
+    o[0] = 1 / r; o[5] = 1 / r; o[10] = -1 / (far - near); o[14] = -near / (far - near); o[15] = 1;
     return o;
   },
   lookAt(e, t, up) {
@@ -48,6 +55,12 @@ const m4 = {
     ]);
   },
 };
+
+const add3 = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+const sub3 = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const scale3 = (a, k) => [a[0] * k, a[1] * k, a[2] * k];
+const cross3 = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const norm3 = (a) => { const l = Math.hypot(...a) || 1; return [a[0] / l, a[1] / l, a[2] / l]; };
 
 // ------------------------------------------------------------- audio blips
 let audio = null;
@@ -91,7 +104,7 @@ async function main() {
   // --------------------------------------------------------- GPU resources
   const MAX_BOXES = 4096;
   const S = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
-  const UNI_FLOATS = 100;
+  const UNI_FLOATS = 172;
   const uniBuf = device.createBuffer({ size: UNI_FLOATS * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const boxBuf = device.createBuffer({ size: MAX_BOXES * 64, usage: S });
   const nodeBuf = device.createBuffer({ size: MAX_BOXES * 2 * 32, usage: S });
@@ -121,6 +134,83 @@ async function main() {
     device.queue.writeBuffer(b, 0, new Uint32Array([1 << k, k === 0 ? 1 : 0, 0, 0]));
     return b;
   });
+  // ---- raster lighting resources (fixed size)
+  const SM_SIZE = 2048, CASCADES = 3;
+  const PROBES = 24 * 12 * 32, PRAYS = 48, PROBE_SPACING = 3, MAX_LIGHTS = 256;
+  const shadowPipe = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module: mod(SHADOW_WGSL, 'shadow'), entryPoint: 'vs' },
+    primitive: { topology: 'triangle-list', cullMode: 'none' },
+    depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less', depthBias: 2, depthBiasSlopeScale: 2.0 },
+  });
+  const probeTPipe = compute(PROBE_TRACE_WGSL, 'probe-trace');
+  const probeUPipe = compute(PROBE_UPDATE_WGSL, 'probe-update');
+  const aoPipe = compute(AO_WGSL, 'ao');
+  const aoBPipe = compute(AO_BLUR_WGSL, 'ao-blur');
+  const lightPipe = compute(LIGHT_WGSL, 'light');
+  const bloomDPipe = compute(BLOOM_DOWN_WGSL, 'bloom-down');
+  const bloomUPipe = compute(BLOOM_UP_WGSL, 'bloom-up');
+  const transpMod = mod(TRANSPARENT_WGSL, 'transparent');
+  const premul = { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' };
+  const transpPipe = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module: transpMod, entryPoint: 'vs' },
+    fragment: { module: transpMod, entryPoint: 'fs', targets: [{ format: 'rgba16float', blend: { color: premul, alpha: premul } }] },
+    primitive: { topology: 'triangle-list', cullMode: 'none' },
+    depthStencil: { format: 'depth32float', depthWriteEnabled: false, depthCompare: 'greater' },
+  });
+  const shadowTex = device.createTexture({ size: [SM_SIZE, SM_SIZE, CASCADES], format: 'depth32float', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+  const shadowLayer = [0, 1, 2].map((l) => shadowTex.createView({ dimension: '2d', baseArrayLayer: l, arrayLayerCount: 1 }));
+  const shadowArray = shadowTex.createView({ dimension: '2d-array' });
+  const shadowSamp = device.createSampler({ compare: 'less', magFilter: 'linear', minFilter: 'linear' });
+  const cascadeBG = [0, 1, 2].map((l) => {
+    const b = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(b, 0, new Uint32Array([l, 0, 0, 0]));
+    return device.createBindGroup({
+      layout: shadowPipe.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: uniBuf } }, { binding: 1, resource: { buffer: boxBuf } }, { binding: 2, resource: { buffer: b } }],
+    });
+  });
+  const probeIrrBuf = device.createBuffer({ size: PROBES * 64 * 16, usage: S });
+  const probeDepBuf = device.createBuffer({ size: PROBES * 256 * 8, usage: S });
+  const probeStateBuf = device.createBuffer({ size: PROBES * 16, usage: S });
+  const rayBuf = device.createBuffer({ size: PROBES * PRAYS * 16, usage: S });
+  const lightBuf = device.createBuffer({ size: MAX_LIGHTS * 32, usage: S });
+  const probeTraceBG = device.createBindGroup({
+    layout: probeTPipe.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniBuf } }, { binding: 1, resource: { buffer: boxBuf } },
+      { binding: 2, resource: { buffer: nodeBuf } }, { binding: 3, resource: { buffer: primBuf } },
+      { binding: 6, resource: { buffer: probeIrrBuf } }, { binding: 7, resource: { buffer: probeDepBuf } },
+      { binding: 8, resource: { buffer: probeStateBuf } }, { binding: 9, resource: { buffer: lightBuf } },
+      { binding: 10, resource: { buffer: rayBuf } },
+    ],
+  });
+  const probeUpdateBG = device.createBindGroup({
+    layout: probeUPipe.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniBuf } }, { binding: 1, resource: { buffer: rayBuf } },
+      { binding: 2, resource: { buffer: probeIrrBuf } }, { binding: 3, resource: { buffer: probeDepBuf } },
+      { binding: 4, resource: { buffer: probeStateBuf } },
+    ],
+  });
+  const transpBG = device.createBindGroup({
+    layout: transpPipe.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniBuf } }, { binding: 1, resource: { buffer: boxBuf } },
+      { binding: 2, resource: shadowArray }, { binding: 3, resource: shadowSamp },
+      { binding: 4, resource: { buffer: probeIrrBuf } }, { binding: 5, resource: { buffer: probeDepBuf } },
+      { binding: 6, resource: { buffer: probeStateBuf } }, { binding: 7, resource: { buffer: lightBuf } },
+    ],
+  });
+  const bloomPrm = [1, 0].map((first) => {
+    const b = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(b, 0, new Float32Array([first, 0, 0, 0]));
+    return b;
+  });
+  const BLOOM_LEVELS = 6;
+  const RASTER_EXPOSURE = 0.62; // hand-tuned: keeps sunlit plastic around 0.8 after ACES
+
   const dnDummy = device.createTexture({ size: [1, 1], format: 'rgba16float', usage: GPUTextureUsage.STORAGE_BINDING }).createView();
 
   const rasterPipe = device.createRenderPipeline({
@@ -192,7 +282,7 @@ async function main() {
   const pairTex = [254, 230, 210].map((sz) => makePairTexture(sz, PAIR_SIGMA, rand));
 
   let W = 0, H = 0, tex = null, views = null, bufs = null, renderScale = 0.75, clearPT = true;
-  let BG = null; // per-parity bind groups
+  let BG = null, bloomPasses = []; // per-parity bind groups, bloom chain
   const RT = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING;
   const ST = GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING;
   const PT_PIXEL_BUDGET = 960 * 540;
@@ -215,12 +305,19 @@ async function main() {
     tex = {
       albedo0: mk('rgba8unorm', RT), normal0: mk('rgba16float', RT), depth0: mk('depth32float', RT),
       albedo1: mk('rgba8unorm', RT), normal1: mk('rgba16float', RT), depth1: mk('depth32float', RT),
-      hist0: mk('rgba16float', ST), hist1: mk('rgba16float', ST), hdr: mk('rgba16float', ST),
+      hist0: mk('rgba16float', ST), hist1: mk('rgba16float', ST), hdr: mk('rgba16float', ST | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC),
       raw: mk('rgba16float', ST), pt: mk('rgba16float', ST),
+      aoRaw: device.createTexture({ size: [Math.max(1, (W + 1) >> 1), Math.max(1, (H + 1) >> 1)], format: 'r32float', usage: ST }), ao: mk('r32float', ST),
+      hdrPrev: mk('rgba16float', GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST),
       dnHist0: mk('rgba16float', ST), dnHist1: mk('rgba16float', ST),
       dnMom0: mk('rgba16float', ST), dnMom1: mk('rgba16float', ST),
       dnA: mk('rgba16float', ST), dnB: mk('rgba16float', ST),
     };
+    // bloom pyramids (half resolution, 6 mips): down chain and accumulated up chain
+    const bw = Math.max(1, W >> 1), bh = Math.max(1, H >> 1);
+    const levels = Math.min(BLOOM_LEVELS, Math.floor(Math.log2(Math.max(1, Math.min(bw, bh)))) + 1);
+    const mkPyr = () => device.createTexture({ size: [bw, bh], format: 'rgba16float', mipLevelCount: levels, usage: ST });
+    tex.bloomD = mkPyr(); tex.bloomU = mkPyr();
     const n = W * H, SB = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
     const mb = (bytes) => device.createBuffer({ size: bytes, usage: SB });
     // two 64-byte reservoir sets (paper: 2 x 64 B / pixel), paired-shift results, dup map
@@ -229,6 +326,37 @@ async function main() {
     const v = {}; for (const k in tex) v[k] = tex[k].createView();
     views = v;
     const buf = (b) => ({ buffer: b });
+    const mip = (t, l) => t.createView({ baseMipLevel: l, mipLevelCount: 1 });
+    const bD = Array.from({ length: levels }, (_, l) => mip(tex.bloomD, l));
+    const bU = Array.from({ length: levels }, (_, l) => mip(tex.bloomU, l));
+    bloomPasses = [];
+    for (let l = 0; l < levels; l++) {
+      const dims = [Math.max(1, bw >> l), Math.max(1, bh >> l)];
+      bloomPasses.push({
+        pipe: bloomDPipe, dims,
+        group: device.createBindGroup({
+          layout: bloomDPipe.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: l === 0 ? v.hdr : bD[l - 1] }, { binding: 1, resource: sampler },
+            { binding: 2, resource: bD[l] }, { binding: 3, resource: buf(bloomPrm[l === 0 ? 0 : 1]) },
+          ],
+        }),
+      });
+    }
+    for (let l = levels - 2; l >= 0; l--) {
+      const dims = [Math.max(1, bw >> l), Math.max(1, bh >> l)];
+      bloomPasses.push({
+        pipe: bloomUPipe, dims,
+        group: device.createBindGroup({
+          layout: bloomUPipe.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: l === levels - 2 ? bD[l + 1] : bU[l + 1] }, { binding: 1, resource: sampler },
+            { binding: 2, resource: bD[l] }, { binding: 3, resource: bU[l] },
+          ],
+        }),
+      });
+    }
+    const bloomOut = levels > 1 ? bU[0] : bD[0];
     BG = [0, 1].map((i) => {
       const cur = { albedo: i ? v.albedo1 : v.albedo0, normal: i ? v.normal1 : v.normal0, depth: i ? v.depth1 : v.depth0 };
       const prev = { albedo: i ? v.albedo0 : v.albedo1, normal: i ? v.normal0 : v.normal1, depth: i ? v.depth0 : v.depth1 };
@@ -243,6 +371,26 @@ async function main() {
       const pairs = (b) => pairTex.map((p, s) => ({ binding: b + s, resource: p.view }));
       return {
         cur,
+        ao: device.createBindGroup({
+          layout: aoPipe.getBindGroupLayout(0),
+          entries: [{ binding: 0, resource: buf(uniBuf) }, { binding: 1, resource: cur.normal }, { binding: 2, resource: cur.depth }, { binding: 3, resource: v.aoRaw }],
+        }),
+        aoB: device.createBindGroup({
+          layout: aoBPipe.getBindGroupLayout(0),
+          entries: [{ binding: 0, resource: buf(uniBuf) }, { binding: 2, resource: cur.depth }, { binding: 3, resource: v.aoRaw }, { binding: 4, resource: v.ao }],
+        }),
+        light: device.createBindGroup({
+          layout: lightPipe.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: buf(uniBuf) }, { binding: 1, resource: buf(boxBuf) },
+            { binding: 2, resource: cur.normal }, { binding: 3, resource: cur.depth }, { binding: 4, resource: cur.albedo },
+            { binding: 5, resource: shadowArray }, { binding: 6, resource: shadowSamp },
+            { binding: 7, resource: buf(probeIrrBuf) }, { binding: 8, resource: buf(probeDepBuf) },
+            { binding: 9, resource: buf(probeStateBuf) }, { binding: 10, resource: buf(lightBuf) },
+            { binding: 11, resource: v.ao }, { binding: 12, resource: v.hdrPrev }, { binding: 13, resource: sampler },
+            { binding: 14, resource: v.hdr },
+          ],
+        }),
         trace: device.createBindGroup({ layout: tracePipe.getBindGroupLayout(0), entries: [...scene, { binding: 6, resource: v.raw }] }),
         shade: device.createBindGroup({
           layout: shadePipe.getBindGroupLayout(0),
@@ -330,7 +478,7 @@ async function main() {
         }),
         post: device.createBindGroup({
           layout: postPipe.getBindGroupLayout(0),
-          entries: [{ binding: 0, resource: v.hdr }, { binding: 1, resource: buf(uniBuf) }, { binding: 2, resource: sampler }],
+          entries: [{ binding: 0, resource: v.hdr }, { binding: 1, resource: buf(uniBuf) }, { binding: 2, resource: sampler }, { binding: 3, resource: bloomOut }],
         }),
       };
     });
@@ -338,14 +486,14 @@ async function main() {
 
   // --------------------------------------------------------- input
   const keys = new Set();
-  let yaw = Math.PI, pitch = 0.32, dist = 18, rtOn = true, ptOn = true, dragging = false, playing = false;
+  let yaw = Math.PI, pitch = 0.32, dist = 18, rtOn = false, ptOn = true, dragging = false, playing = false;
   const SCALES = [1, 0.75, 0.5];
   let scaleIdx = 1; // default 75%: ReSTIR PT Enhanced runs at full render resolution
   addEventListener('keydown', (e) => {
     keys.add(e.code);
     if (e.code === 'Space') e.preventDefault();
     if (e.repeat) return;
-    if (e.code === 'KeyR') { rtOn = !rtOn; flashMsg(rtOn ? 'Ray tracing ON' : 'Raster only'); }
+    if (e.code === 'KeyR') { rtOn = !rtOn; clearPT = true; flashMsg(rtOn ? (ptOn ? 'ReSTIR PT Enhanced' : 'Hybrid ray tracing') : 'Raster lighting: probes + lights + shadow maps'); }
     if (e.code === 'KeyP') { ptOn = !ptOn; clearPT = true; flashMsg(ptOn ? 'ReSTIR PT Enhanced ON' : 'Hybrid RT (direct shadows + mirrors, flat ambient)'); }
     if (e.code === 'KeyG') { scaleIdx = (scaleIdx + 1) % SCALES.length; renderScale = SCALES[scaleIdx]; flashMsg(`Render scale ${Math.round(renderScale * 100)}%`); }
     if (e.code === 'KeyK') w.respawn();
@@ -416,6 +564,9 @@ async function main() {
     device.queue.writeBuffer(nodeBuf, 0, mem, w.nodes_ptr(), nn * 32);
     device.queue.writeBuffer(primBuf, 0, mem, w.prims_ptr(), np * 4);
 
+    const nl = w.light_count();
+    device.queue.writeBuffer(lightBuf, 0, mem, w.lights_ptr(), Math.min(nl, MAX_LIGHTS) * 32);
+
     const view = m4.lookAt(eye, target, [0, 1, 0]);
     const proj = m4.persp(70 * Math.PI / 180, W / H, 0.1);
     const vp = m4.mul(proj, view);
@@ -432,6 +583,41 @@ async function main() {
     uni.set([...(prevEye || eye), 0], 84);
     // random flip / mirror / transpose / offset of each pairing texture, every frame (Sec. 3.2)
     pairTex.forEach((p, s) => uni.set([Math.floor(rand() * 8), Math.floor(rand() * p.size), Math.floor(rand() * p.size), 0], 88 + s * 4));
+
+    // ---- cascaded shadow maps: fit a sphere around each frustum slice, snap to texels
+    const fwd = norm3(sub3(target, eye));
+    const tanY = Math.tan(35 * Math.PI / 180), tanX = tanY * W / H;
+    const right = norm3(cross3(fwd, [0, 1, 0])), up = cross3(right, fwd);
+    const splits = [0.1, dist + 10, (dist + 10) * 2.8, 190];
+    const texel = [0, 0, 0, 0], range = [0, 0, 0, 0];
+    for (let c = 0; c < CASCADES; c++) {
+      const n = splits[c], f = splits[c + 1];
+      const pts = [];
+      for (const z of [n, f]) for (const sx of [-1, 1]) for (const sy of [-1, 1])
+        pts.push(add3(eye, add3(scale3(fwd, z), add3(scale3(right, sx * tanX * z), scale3(up, sy * tanY * z)))));
+      const ctr = pts.reduce((a, p) => add3(a, scale3(p, 1 / 8)), [0, 0, 0]);
+      let r = 0; for (const p of pts) r = Math.max(r, Math.hypot(...sub3(p, ctr)));
+      r = Math.ceil(r * 4) / 4;
+      const back = r + 160;
+      const lv = m4.lookAt(add3(ctr, scale3(sun, back)), ctr, Math.abs(sun[1]) > 0.95 ? [0, 0, 1] : [0, 1, 0]);
+      const lvp = m4.mul(m4.ortho(r, 0, back + r + 40), lv);
+      // texel snapping keeps the shadow edges from crawling when the camera moves
+      const ox = lvp[12] * SM_SIZE / 2, oy = lvp[13] * SM_SIZE / 2;
+      lvp[12] += (Math.round(ox) - ox) * 2 / SM_SIZE;
+      lvp[13] += (Math.round(oy) - oy) * 2 / SM_SIZE;
+      uni.set(lvp, 100 + c * 16);
+      texel[c] = 2 * r / SM_SIZE;
+      range[c] = back + r + 40;
+    }
+    uni.set([splits[1], splits[2], splits[3], 0.022], 148);
+    uni.set(texel, 152);
+    uni.set(range, 156);
+    // ---- DDGI probe volume follows the player, biased towards where the camera looks
+    const fwdFlat = norm3([fwd[0], 0, fwd[2]]);
+    const pc = add3(target, scale3(fwdFlat, 14));
+    uni.set([Math.floor(pc[0] / PROBE_SPACING) - 12, Math.floor(pc[1] / PROBE_SPACING) - 4, Math.floor(pc[2] / PROBE_SPACING) - 16, PROBE_SPACING], 160);
+    uni.set([0.95, frameNo, Math.min(nl, MAX_LIGHTS), 0.1], 164);
+    uni.set([rtOn ? 0 : 1, 1, 1, RASTER_EXPOSURE], 168);
     device.queue.writeBuffer(uniBuf, 0, uni);
     prevVP = vp; prevInvVP = invVP; prevEye = eye;
     flash = Math.max(0, flash - dt * 2.5);
@@ -450,6 +636,20 @@ async function main() {
     rp.setBindGroup(0, rasterBG);
     rp.draw(36, nb);
     rp.end();
+
+    if (!rtOn) {
+      // sun shadow cascades
+      for (let c = 0; c < CASCADES; c++) {
+        const sp = enc.beginRenderPass({
+          colorAttachments: [],
+          depthStencilAttachment: { view: shadowLayer[c], depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' },
+        });
+        sp.setPipeline(shadowPipe);
+        sp.setBindGroup(0, cascadeBG[c]);
+        sp.draw(36, nb);
+        sp.end();
+      }
+    }
 
     const gx = Math.ceil(W / 8), gy = Math.ceil(H / 8);
     const run = (pipe, group, x = gx, y = gy) => {
@@ -470,7 +670,25 @@ async function main() {
     } else if (rtOn) {
       run(tracePipe, bg.trace);
     }
-    run(shadePipe, bg.shade);
+    if (rtOn) {
+      run(shadePipe, bg.shade);
+    } else {
+      run(probeTPipe, probeTraceBG, Math.ceil(PROBES / 2 * PRAYS / 64), 1); // DDGI: trace probe rays
+      run(probeUPipe, probeUpdateBG, PROBES / 2, 1);                        // DDGI: blend into probes
+      run(aoPipe, bg.ao, Math.ceil(W / 16), Math.ceil(H / 16)); // half-res AO
+      run(aoBPipe, bg.aoB);
+      run(lightPipe, bg.light);                                         // deferred lighting
+      const tp = enc.beginRenderPass({                                  // forward glass on top
+        colorAttachments: [{ view: views.hdr, loadOp: 'load', storeOp: 'store' }],
+        depthStencilAttachment: { view: bg.cur.depth, depthReadOnly: true },
+      });
+      tp.setPipeline(transpPipe);
+      tp.setBindGroup(0, transpBG);
+      tp.draw(36, nb);
+      tp.end();
+      enc.copyTextureToTexture({ texture: tex.hdr }, { texture: tex.hdrPrev }, [W, H]); // for next frame's SSR
+    }
+    for (const b of bloomPasses) run(b.pipe, b.group, Math.ceil(b.dims[0] / 8), Math.ceil(b.dims[1] / 8));
 
     const pp = enc.beginRenderPass({
       colorAttachments: [{ view: ctx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }],
@@ -489,7 +707,7 @@ async function main() {
     $('stage').textContent = `${out[9]} / ${out[10]}`;
     $('deaths').textContent = out[11];
     $('time').textContent = fmtTime(out[12]);
-    $('perf').textContent = `${fps.toFixed(0)} fps · ${gpuMs.toFixed(1)} ms · ${W}×${H} · ${nb} boxes · ${rtOn ? (ptOn ? 'ReSTIR PT Enhanced' : 'hybrid RT') : 'raster'}`;
+    $('perf').textContent = `${fps.toFixed(0)} fps · ${gpuMs.toFixed(1)} ms · ${W}×${H} · ${nb} boxes · ${rtOn ? (ptOn ? 'ReSTIR PT Enhanced' : 'hybrid RT') : `raster GI · ${nl} lights`}`;
     if (msgTimer > 0) { msgTimer -= dt; if (msgTimer <= 0) $('msg').style.opacity = 0; }
     requestAnimationFrame(tick);
   }

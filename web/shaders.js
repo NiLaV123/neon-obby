@@ -20,6 +20,14 @@ struct U {
   opts: vec4f,     // x ReSTIR PT Enhanced on
   prevCam: vec4f,  // previous frame camera position
   pair: array<vec4f, 3>,  // per-frame transforms of the 3 pairing textures (flags, offset)
+  // ---- raster lighting
+  sunVP: array<mat4x4f, 3>, // cascaded shadow map view-projections
+  cascade: vec4f,           // xyz far split (view distance) per cascade, w sun penumbra spread
+  cascadeTexel: vec4f,      // world size of one shadow texel per cascade
+  cascadeRange: vec4f,      // world depth range per cascade (light space z)
+  probeGrid: vec4f,         // xyz first probe cell of the scrolling DDGI volume, w spacing
+  probeInfo: vec4f,         // x hysteresis, y frame (ray rotation), z light count, w bloom strength
+  rasterInfo: vec4f,        // x raster lighting mode on, y SSR on, z AO strength, w exposure
 };
 struct Box { c: vec3f, mat: f32, h: vec3f, emis: f32, q: vec4f, col: vec3f, refl: f32 };
 
@@ -95,6 +103,9 @@ struct VO {
   let wp = qrot(b.q, lp) + b.c;
   var o: VO;
   o.pos = u.viewProj * vec4f(wp, 1.0);
+  // raster lighting draws see-through parts in a forward pass after the deferred lighting
+  let m = matOf(b);
+  if (u.rasterInfo.x > 0.5 && (m == M_GLASS || m == M_GHOST)) { o.pos = vec4f(2.0, 2.0, 2.0, 1.0); }
   o.lp = lp;
   o.ln = n;
   o.id = ii;
@@ -113,6 +124,33 @@ struct FO { @location(0) albedo: vec4f, @location(1) normal: vec4f };
 `;
 
 // Shared by the TRACE and SHADE compute passes.
+// Sun, sky and flat ambient, shared by every lighting path.
+const SKY_FN = /* wgsl */ `
+const SUN_COL = vec3f(1.0, 0.94, 0.84) * 2.7;
+fn sky(rd: vec3f) -> vec3f {
+  let zen = vec3f(0.18, 0.42, 0.92);
+  let hor = vec3f(0.70, 0.83, 0.97);
+  var c = mix(hor, zen, pow(clamp(rd.y, 0.0, 1.0), 0.55));
+  c = mix(c, vec3f(0.62, 0.5, 0.45), 1.0 - smoothstep(-0.25, 0.0, rd.y));
+  let sd = max(dot(rd, u.sunDir.xyz), 0.0);
+  c += vec3f(1.0, 0.9, 0.7) * (pow(sd, 1500.0) * 60.0 + pow(sd, 10.0) * 0.3);
+  return c;
+}
+
+// sky without the sun disc (for probes and rough reflections)
+fn skyDiffuse(rd: vec3f) -> vec3f {
+  let zen = vec3f(0.18, 0.42, 0.92);
+  let hor = vec3f(0.70, 0.83, 0.97);
+  var c = mix(hor, zen, pow(clamp(rd.y, 0.0, 1.0), 0.55));
+  c = mix(c, vec3f(0.62, 0.5, 0.45), 1.0 - smoothstep(-0.25, 0.0, rd.y));
+  return c + vec3f(1.0, 0.9, 0.7) * pow(max(dot(rd, u.sunDir.xyz), 0.0), 10.0) * 0.3;
+}
+fn ambient(n: vec3f) -> vec3f {
+  return mix(vec3f(0.45, 0.36, 0.30), vec3f(0.50, 0.64, 0.92), n.y * 0.5 + 0.5) * 0.85;
+}
+
+`;
+
 const RT_COMMON = COMMON + /* wgsl */ `
 struct Node { mn: vec3f, lf: u32, mx: vec3f, cnt: u32 };
 
@@ -124,7 +162,6 @@ struct Node { mn: vec3f, lf: u32, mx: vec3f, cnt: u32 };
 @group(0) @binding(5) var depthTex: texture_depth_2d;
 
 const NONE = 0xffffffffu;
-const SUN_COL = vec3f(1.0, 0.94, 0.84) * 2.7;
 
 fn pcg(v: u32) -> u32 {
   let s = v * 747796405u + 2891336453u;
@@ -135,16 +172,7 @@ fn rnd(s: ptr<function, u32>) -> f32 { *s = pcg(*s); return f32(*s >> 8u) / 1677
 
 fn safeInv(d: vec3f) -> vec3f { return 1.0 / select(d, vec3f(1e-9), abs(d) < vec3f(1e-9)); }
 
-fn sky(rd: vec3f) -> vec3f {
-  let zen = vec3f(0.18, 0.42, 0.92);
-  let hor = vec3f(0.70, 0.83, 0.97);
-  var c = mix(hor, zen, pow(clamp(rd.y, 0.0, 1.0), 0.55));
-  c = mix(c, vec3f(0.62, 0.5, 0.45), 1.0 - smoothstep(-0.25, 0.0, rd.y));
-  let sd = max(dot(rd, u.sunDir.xyz), 0.0);
-  c += vec3f(1.0, 0.9, 0.7) * (pow(sd, 1500.0) * 60.0 + pow(sd, 10.0) * 0.3);
-  return c;
-}
-
+${SKY_FN}
 fn boxHit(b: Box, ro: vec3f, rd: vec3f, tmax: f32) -> f32 {
   let lo = qinv(b.q, ro - b.c);
   let inv = safeInv(qinv(b.q, rd));
@@ -240,10 +268,6 @@ fn surfAt(id: u32, p: vec3f) -> Surf {
   else if (r.y >= r.z) { ln.y = sign(lp.y); }
   else { ln.z = sign(lp.z); }
   return Surf(p, qrot(b.q, ln), albedoAt(b, lp, ln), id);
-}
-
-fn ambient(n: vec3f) -> vec3f {
-  return mix(vec3f(0.45, 0.36, 0.30), vec3f(0.50, 0.64, 0.92), n.y * 0.5 + 0.5) * 0.85;
 }
 
 // amb = indirect irradiance (flat ambient*AO, or the ReSTIR PT result)
@@ -1418,6 +1442,7 @@ export const POST_WGSL = COMMON + /* wgsl */ `
 @group(0) @binding(0) var hdr: texture_2d<f32>;
 @group(0) @binding(1) var<uniform> u: U;
 @group(0) @binding(2) var samp: sampler;
+@group(0) @binding(3) var bloom: texture_2d<f32>;
 
 @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
   let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
@@ -1431,11 +1456,917 @@ fn aces(x: vec3f) -> vec3f {
 @fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
   let uv = fc.xy / u.misc.zw;
   var c = textureSample(hdr, samp, uv).rgb * u.misc.y;
+  // bloom: the up-chain sums 6 levels, so normalise before mixing
+  let bl = textureSample(bloom, samp, uv).rgb / 6.0;
+  c = mix(c, bl, u.probeInfo.w);
   c = aces(c);
+  // gentle grade: a touch more saturation and contrast in the mids
+  let l = dot(c, vec3f(0.2126, 0.7152, 0.0722));
+  c = mix(vec3f(l), c, 1.08);
+  c = clamp(c, vec3f(0.0), vec3f(1.0));
+  c = c * c * (3.0 - 2.0 * c) * 0.18 + c * 0.82;
   let v = uv * (1.0 - uv);
   c *= pow(clamp(v.x * v.y * 16.0, 0.0, 1.0), 0.18);
   c = pow(c, vec3f(1.0 / 2.2));
   c = mix(c, vec3f(1.0, 0.15, 0.1), u.misc.x * 0.45);
   return vec4f(c, 1.0);
+}
+`;
+
+// =============================================================================================
+// RASTER LIGHTING ("how a shipped game would light it"): no per-pixel ray tracing.
+//   SHADOW        – 3 cascaded sun shadow maps (depth only, stabilised, slope-scaled bias)
+//   PROBE_TRACE   – DDGI: every probe of a camera-following 24x12x32 grid shoots 48 rays per
+//                   frame (spherical Fibonacci, randomly rotated); hit radiance = sun + local
+//                   lights + emission + last frame's probes (infinite bounces)
+//   PROBE_UPDATE  – blend rays into 8x8 octahedral irradiance + 16x16 depth-moment maps with
+//                   hysteresis; classify probes stuck inside geometry
+//   AO / AO_BLUR  – horizon-based ambient occlusion (4 dirs x 4 steps, 4x4 Bayer + 4x4 blur)
+//   LIGHT         – deferred: GGX sun with PCSS soft shadows, hand-placed point lights,
+//                   probe GI with Chebyshev visibility, multi-bounce AO, split-sum specular
+//                   with screen-space reflections (from last frame) over a probe/sky fallback,
+//                   height fog with sun in-scattering
+//   TRANSPARENT   – forward pass for glass and ghost blocks over the lit image
+//   BLOOM_DOWN/UP – 6-level dual-filter bloom (13-tap down with Karis average, tent up)
+// =============================================================================================
+
+const BRDF_FN = /* wgsl */ `
+const PI = 3.14159265;
+struct Mat { rough: f32, metal: f32 };
+fn matParams(m: u32) -> Mat {
+  if (m == M_METAL) { return Mat(0.05, 1.0); }
+  if (m == M_POLISHED) { return Mat(0.07, 0.0); }
+  if (m == M_SMOOTH) { return Mat(0.32, 0.0); }
+  if (m == M_NEON) { return Mat(0.45, 0.0); }
+  if (m == M_CHECK) { return Mat(0.25, 0.0); }
+  if (m == M_GLASS || m == M_GHOST) { return Mat(0.02, 0.0); }
+  return Mat(0.5, 0.0);                      // Roblox plastic
+}
+fn fSchlick(f0: vec3f, c: f32) -> vec3f { return f0 + (1.0 - f0) * pow(1.0 - clamp(c, 0.0, 1.0), 5.0); }
+// Diffuse + GGX specular for one light, in this renderer's units (diffuse = albedo * E).
+fn brdf(n: vec3f, v: vec3f, l: vec3f, alb: vec3f, mt: Mat) -> vec3f {
+  let h = normalize(v + l);
+  let nl = max(dot(n, l), 1e-4);
+  let nv = max(dot(n, v), 1e-4);
+  let nh = max(dot(n, h), 0.0);
+  let a = max(mt.rough * mt.rough, 0.002);
+  let a2 = a * a;
+  let dd = nh * nh * (a2 - 1.0) + 1.0;
+  let D = a2 / (PI * dd * dd);
+  let k = a * 0.5;
+  let Vis = 0.25 / ((nv * (1.0 - k) + k) * (nl * (1.0 - k) + k));
+  let f0 = mix(vec3f(0.04), alb, mt.metal);
+  let F = fSchlick(f0, dot(v, h));
+  return alb * (1.0 - F) * (1.0 - mt.metal) + PI * D * Vis * F;
+}
+// split-sum environment BRDF (Karis' analytic fit)
+fn envBRDF(f0: vec3f, nv: f32, rough: f32) -> vec3f {
+  let r = rough * vec4f(-1.0, -0.0275, -0.572, 0.022) + vec4f(1.0, 0.0425, 1.04, -0.04);
+  let a004 = min(r.x * r.x, exp2(-9.28 * nv)) * r.x + r.y;
+  let ab = vec2f(-1.04, 1.04) * a004 + r.zw;
+  return f0 * ab.x + ab.y;
+}
+`;
+
+// Hand-placed point lights (authored in the Rust level, attached to moving parts).
+const LIGHTS_FN = /* wgsl */ `
+struct Light { p: vec3f, radius: f32, col: vec3f, pad: f32 };
+fn shadeLight(L: Light, p: vec3f, n: vec3f, v: vec3f, alb: vec3f, mt: Mat) -> vec3f {
+  let dv = L.p - p;
+  let d2 = dot(dv, dv);
+  let r2 = L.radius * L.radius;
+  if (d2 >= r2) { return vec3f(0.0); }
+  let l = dv * inverseSqrt(max(d2, 1e-6));
+  let nl = dot(n, l);
+  if (nl <= 0.0) { return vec3f(0.0); }
+  let x = d2 / r2;
+  let win = (1.0 - x * x) * (1.0 - x * x);
+  return brdf(n, v, l, alb, mt) * L.col * (win / (d2 + 1.0)) * nl;
+}
+fn localLights(p: vec3f, n: vec3f, v: vec3f, alb: vec3f, mt: Mat) -> vec3f {
+  var o = vec3f(0.0);
+  let cnt = u32(u.probeInfo.z);
+  for (var i = 0u; i < cnt; i++) {
+    let L = lights[i];
+    let dv = L.p - p;
+    let d2 = dot(dv, dv);
+    let r2 = L.radius * L.radius;
+    if (d2 >= r2) { continue; }
+    let l = dv * inverseSqrt(max(d2, 1e-6));
+    let nl = dot(n, l);
+    if (nl <= 0.0) { continue; }
+    // inverse-square with a smooth window to zero at the light's radius (UE4 falloff)
+    let x = d2 / r2;
+    let win = (1.0 - x * x) * (1.0 - x * x);
+    o += brdf(n, v, l, alb, mt) * L.col * (win / (d2 + 1.0)) * nl;
+  }
+  return o;
+}
+`;
+
+// DDGI probe volume: toroidal addressing so the grid can scroll with the player and only the
+// newly entered slab of probes has to start over.
+const PROBE_FN = /* wgsl */ `
+const PDIM = vec3i(24, 12, 32);
+const PCOUNT = 9216u;
+const PRAYS = 48u;
+
+fn octEncode(n0: vec3f) -> vec2f {
+  let n = n0 / (abs(n0.x) + abs(n0.y) + abs(n0.z));
+  if (n.z < 0.0) {
+    return (1.0 - abs(n.yx)) * select(vec2f(-1.0), vec2f(1.0), n.xy >= vec2f(0.0));
+  }
+  return n.xy;
+}
+fn octDecode(e: vec2f) -> vec3f {
+  var v = vec3f(e, 1.0 - abs(e.x) - abs(e.y));
+  if (v.z < 0.0) {
+    let t = (1.0 - abs(v.yx)) * select(vec2f(-1.0), vec2f(1.0), v.xy >= vec2f(0.0));
+    v = vec3f(t, v.z);
+  }
+  return normalize(v);
+}
+fn gridBase() -> vec3i { return vec3i(u.probeGrid.xyz); }
+fn probeSlot(cell: vec3i) -> u32 {
+  let m = ((cell % PDIM) + PDIM) % PDIM;
+  return u32(m.x + PDIM.x * (m.y + PDIM.y * m.z));
+}
+fn cellOfSlot(slot: u32) -> vec3i {
+  let sl = vec3i(i32(slot % 24u), i32((slot / 24u) % 12u), i32(slot / 288u));
+  let b = gridBase();
+  return b + (((sl - b) % PDIM) + PDIM) % PDIM;
+}
+fn probePos(cell: vec3i) -> vec3f { return (vec3f(cell) + 0.5) * u.probeGrid.w; }
+
+fn irrTexel(slot: u32, t: vec2i) -> vec3f { return probeIrr[slot * 64u + u32(t.y * 8 + t.x)].rgb; }
+fn sampleIrr(slot: u32, dir: vec3f) -> vec3f {
+  let uv = (octEncode(dir) * 0.5 + 0.5) * 8.0 - 0.5;
+  let f = fract(uv);
+  let i0 = vec2i(floor(uv));
+  let a = clamp(i0, vec2i(0), vec2i(7));
+  let b = clamp(i0 + 1, vec2i(0), vec2i(7));
+  return mix(mix(irrTexel(slot, a), irrTexel(slot, vec2i(b.x, a.y)), f.x),
+             mix(irrTexel(slot, vec2i(a.x, b.y)), irrTexel(slot, b), f.x), f.y);
+}
+fn depTexel(slot: u32, t: vec2i) -> vec2f { return probeDepth[slot * 256u + u32(t.y * 16 + t.x)]; }
+fn sampleDep(slot: u32, dir: vec3f) -> vec2f {
+  let uv = (octEncode(dir) * 0.5 + 0.5) * 16.0 - 0.5;
+  let f = fract(uv);
+  let i0 = vec2i(floor(uv));
+  let a = clamp(i0, vec2i(0), vec2i(15));
+  let b = clamp(i0 + 1, vec2i(0), vec2i(15));
+  return mix(mix(depTexel(slot, a), depTexel(slot, vec2i(b.x, a.y)), f.x),
+             mix(depTexel(slot, vec2i(a.x, b.y)), depTexel(slot, b), f.x), f.y);
+}
+
+// Irradiance at p (normal n, v = towards the viewer / ray origin) looked up in direction sdir,
+// from the 8 surrounding probes with trilinear, backface and Chebyshev visibility weights.
+struct ProbeHit { irr: vec3f, refl: vec3f, w: f32 };
+fn probeLookup2(p: vec3f, n: vec3f, v: vec3f, sdir: vec3f, both: bool) -> ProbeHit {
+  let sp = u.probeGrid.w;
+  let pb = p + (n * 0.2 + v * 0.8) * (0.3 * sp);
+  let g = pb / sp - 0.5;
+  let c0 = vec3i(floor(g));
+  let al = g - vec3f(c0);
+  let base = gridBase();
+  var sum = vec3f(0.0);
+  var sumR = vec3f(0.0);
+  var ws = 0.0;
+  for (var i = 0u; i < 8u; i++) {
+    let off = vec3i(i32(i & 1u), i32((i >> 1u) & 1u), i32((i >> 2u) & 1u));
+    let cell = c0 + off;
+    if (any(cell < base) || any(cell >= base + PDIM)) { continue; }
+    let slot = probeSlot(cell);
+    let st = probeState[slot];
+    if (st.w == 0 || any(st.xyz != cell)) { continue; }
+    let pp = probePos(cell);
+    let tri = select(1.0 - al, al, off == vec3i(1));
+    var w = 1.0;
+    let dirTo = normalize(pp - p);
+    let bf = (dot(dirTo, n) + 1.0) * 0.5;
+    w *= bf * bf + 0.2;
+    let pv = pb - pp;
+    let d = length(pv);
+    let m = sampleDep(slot, pv / max(d, 1e-4));
+    if (d > m.x) {
+      let vr = abs(m.y - m.x * m.x);
+      let dd = d - m.x;
+      let ch = vr / (vr + dd * dd);
+      w *= max(ch * ch * ch, 0.0);
+    }
+    w = max(w, 1e-6);
+    if (w < 0.2) { w *= w * w / 0.04; }
+    w *= tri.x * tri.y * tri.z;
+    sum += w * sampleIrr(slot, n);
+    if (both) { sumR += w * sampleIrr(slot, sdir); }
+    ws += w;
+  }
+  if (ws <= 1e-5) {
+    // outside the volume / no valid probes yet: a flat sky-ish ambient
+    let fb = mix(vec3f(0.45, 0.36, 0.30), vec3f(0.50, 0.64, 0.92), n.y * 0.5 + 0.5) * 0.6;
+    return ProbeHit(fb, skyDiffuse(sdir), 0.0);
+  }
+  return ProbeHit(sum / ws, sumR / ws, ws);
+}
+fn probeIrradiance(p: vec3f, n: vec3f, v: vec3f) -> vec3f { return probeLookup2(p, n, v, n, false).irr; }
+// fraction of the nearest probe's rays in direction d that escaped to the sky
+fn skyVisibility(p: vec3f, d: vec3f) -> f32 {
+  let sp = u.probeGrid.w;
+  let cell = vec3i(floor(p / sp));
+  let base = gridBase();
+  if (any(cell < base) || any(cell >= base + PDIM)) { return 1.0; }
+  let slot = probeSlot(cell);
+  let st = probeState[slot];
+  if (st.w == 0 || any(st.xyz != cell)) { return 1.0; }
+  let m = sampleDep(slot, d);
+  return smoothstep(sp * 1.0, sp * 1.45, m.x);
+}
+`;
+
+const SHADOW_FN = /* wgsl */ `
+const SM_SIZE = 2048.0;
+const POISSON = array<vec2f, 16>(
+  vec2f(-0.94201624, -0.39906216), vec2f(0.94558609, -0.76890725), vec2f(-0.094184101, -0.92938870),
+  vec2f(0.34495938, 0.29387760), vec2f(-0.91588581, 0.45771432), vec2f(-0.81544232, -0.87912464),
+  vec2f(-0.38277543, 0.27676845), vec2f(0.97484398, 0.75648379), vec2f(0.44323325, -0.97511554),
+  vec2f(0.53742981, -0.47373420), vec2f(-0.26496911, -0.41893023), vec2f(0.79197514, 0.19090188),
+  vec2f(-0.24188840, 0.99706507), vec2f(-0.81409955, 0.91437590), vec2f(0.19984126, 0.78641367),
+  vec2f(0.14383161, -0.14100790));
+
+// Contact-hardening soft sun shadow (PCSS): blocker search, penumbra from the blocker distance,
+// then a rotated 16-tap Poisson PCF with hardware 2x2 comparison filtering per tap.
+fn sunShadow(wp: vec3f, n: vec3f, viewZ: f32, noise: f32) -> f32 {
+  let L = u.sunDir.xyz;
+  if (dot(n, L) <= 0.0) { return 0.0; }
+  if (viewZ > u.cascade.z) { return 1.0; }
+  var c = 2;
+  if (viewZ < u.cascade.x) { c = 0; } else if (viewZ < u.cascade.y) { c = 1; }
+  let texel = u.cascadeTexel[c];
+  let nl = clamp(dot(n, L), 0.0, 1.0);
+  let pw = wp + n * texel * (1.0 + 2.0 * (1.0 - nl)) + L * texel;
+  let lc = u.sunVP[c] * vec4f(pw, 1.0);
+  let uv = vec2f(lc.x * 0.5 + 0.5, 0.5 - lc.y * 0.5);
+  let z = lc.z;
+  if (any(uv < vec2f(0.0)) || any(uv > vec2f(1.0)) || z > 1.0) { return 1.0; }
+  let ang = noise * 6.2831853;
+  let rot = mat2x2f(cos(ang), sin(ang), -sin(ang), cos(ang));
+
+  // blocker search (radius covers the widest penumbra we allow)
+  let search = clamp(1.2 / texel, 3.0, 14.0);
+  var bsum = 0.0;
+  var bn = 0.0;
+  for (var i = 0; i < 12; i++) {
+    let o = rot * POISSON[i] * search;
+    let t = clamp(vec2i(uv * SM_SIZE + o), vec2i(0), vec2i(i32(SM_SIZE) - 1));
+    let d = textureLoad(shadowMap, t, c, 0);
+    if (d < z) { bsum += d; bn += 1.0; }
+  }
+  if (bn == 0.0) { return 1.0; }
+  let zb = bsum / bn;
+  let penumbra = (z - zb) * u.cascadeRange[c] * u.cascade.w;
+  let rad = clamp(penumbra / texel, 1.0, search);
+  var vis = 0.0;
+  for (var i = 0; i < 16; i++) {
+    let o = rot * POISSON[i] * rad / SM_SIZE;
+    vis += textureSampleCompareLevel(shadowMap, shadowSamp, uv + o, c, z);
+  }
+  return vis / 16.0;
+}
+`;
+
+const FOG_FN = /* wgsl */ `
+// Exponential height fog integrated along the view ray, lit by the sun and the lava below.
+fn heightFog(col: vec3f, wp: vec3f, cam: vec3f) -> vec3f {
+  let rv = wp - cam;
+  let dist = length(rv);
+  let rd = rv / max(dist, 1e-4);
+  let dens = 0.0028;
+  let fall = 0.05;
+  let h0 = 2.0;
+  // integrate down to at most a little below the course, so looking at the lava doesn't fog it out
+  let dy = max(wp.y, -3.0) - cam.y;
+  var k = 1.0;
+  if (abs(dy) > 0.01) { k = (1.0 - exp(-fall * dy)) / (fall * dy); }
+  let amount = dens * exp(-fall * (cam.y - h0)) * max(dist - 8.0, 0.0) * k;
+  let f = 1.0 - exp(-amount);
+  let sunAmt = pow(max(dot(rd, u.sunDir.xyz), 0.0), 8.0);
+  var fc = mix(vec3f(0.52, 0.64, 0.84), vec3f(1.0, 0.84, 0.6) * 1.4, sunAmt);
+  fc = mix(fc, vec3f(0.9, 0.36, 0.14), clamp((-wp.y - 2.0) / 14.0, 0.0, 1.0) * 0.35);
+  return mix(col, fc, f);
+}
+`;
+
+// Shared box expansion (36 vertices per instance) for the shadow and transparent passes.
+const BOX_VS_FN = /* wgsl */ `
+fn boxCorner(b: Box, vi: u32) -> array<vec3f, 2> {
+  let f = vi / 6u;
+  let k = vi % 6u;
+  let axis = f / 2u;
+  let s = select(-1.0, 1.0, (f & 1u) == 0u);
+  var n = vec3f(0.0);
+  n[axis] = s;
+  var tu = vec3f(0.0);
+  tu[(axis + 1u) % 3u] = 1.0;
+  var tv = vec3f(0.0);
+  tv[(axis + 2u) % 3u] = 1.0;
+  var quad = array<vec2f, 6>(vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0),
+                             vec2f(-1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, 1.0));
+  let c2 = quad[k];
+  let lp = (n + tu * c2.x + tv * c2.y) * b.h;
+  return array<vec3f, 2>(qrot(b.q, lp) + b.c, qrot(b.q, n));
+}
+`;
+
+export const SHADOW_WGSL = COMMON + BOX_VS_FN + /* wgsl */ `
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var<storage, read> boxes: array<Box>;
+@group(0) @binding(2) var<uniform> cas: vec4u;
+
+@vertex fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> @builtin(position) vec4f {
+  let b = boxes[ii];
+  let m = matOf(b);
+  // see-through parts and the huge lava slab don't cast sun shadows
+  if (m == M_GLASS || m == M_GHOST || b.h.x > 300.0) { return vec4f(2.0, 2.0, 2.0, 1.0); }
+  let w = boxCorner(b, vi);
+  return u.sunVP[cas.x] * vec4f(w[0], 1.0);
+}
+`;
+
+export const PROBE_TRACE_WGSL = RT_COMMON + BRDF_FN + /* wgsl */ `
+@group(0) @binding(6) var<storage, read> probeIrr: array<vec4f>;
+@group(0) @binding(7) var<storage, read> probeDepth: array<vec2f>;
+@group(0) @binding(8) var<storage, read> probeState: array<vec4i>;
+@group(0) @binding(9) var<storage, read> lights: array<Light>;
+@group(0) @binding(10) var<storage, read_write> rays: array<vec4f>;
+` + PROBE_FN + LIGHTS_FN + /* wgsl */ `
+// random rotation per frame so the 48 fixed directions cover the sphere over time
+fn rayRot() -> mat3x3f {
+  var s = pcg(u32(u.probeInfo.y) * 9781u + 1u);
+  let u1 = rnd(&s); let u2 = rnd(&s); let u3 = rnd(&s);
+  let q = vec4f(sqrt(1.0 - u1) * sin(6.2831853 * u2), sqrt(1.0 - u1) * cos(6.2831853 * u2),
+                sqrt(u1) * sin(6.2831853 * u3), sqrt(u1) * cos(6.2831853 * u3));
+  return mat3x3f(qrot(q, vec3f(1.0, 0.0, 0.0)), qrot(q, vec3f(0.0, 1.0, 0.0)), qrot(q, vec3f(0.0, 0.0, 1.0)));
+}
+fn sphFib(i: u32) -> vec3f {
+  let k = f32(i) + 0.5;
+  let z = 1.0 - 2.0 * k / f32(PRAYS);
+  let r = sqrt(max(1.0 - z * z, 0.0));
+  let ph = 6.2831853 * fract(k * 0.61803399);
+  return vec3f(r * cos(ph), r * sin(ph), z);
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let t = gid.x;
+  if (t >= PCOUNT / 2u * PRAYS) { return; }
+  let slot = (t / PRAYS) * 2u + (u32(u.probeInfo.y) & 1u);   // half the probes each frame
+  let ri = t % PRAYS;
+  let ro = slot * PRAYS + ri;
+  let o = probePos(cellOfSlot(slot));
+  let d = rayRot() * sphFib(ri);
+  let h = trace(o, d, 1e4, NONE, false);
+  if (h.id == NONE) { rays[ro] = vec4f(skyDiffuse(d), 1e4); return; }
+  let sf = surfAt(h.id, o + d * h.t);
+  if (dot(sf.n, d) > 0.0) { rays[ro] = vec4f(0.0, 0.0, 0.0, -h.t * 0.2); return; }  // inside a box
+  let b = boxes[h.id];
+  let mt = matParams(matOf(b));
+  let v = -d;
+  var L = vec3f(0.0);
+  let ndl = dot(sf.n, u.sunDir.xyz);
+  if (ndl > 0.0) { L += sf.alb * SUN_COL * ndl * hardShadow(sf.p, sf.n); }
+  L += localLights(sf.p, sf.n, v, sf.alb, Mat(1.0, 0.0));
+  L += sf.alb * probeIrradiance(sf.p, sf.n, v) * (1.0 - mt.metal * 0.5);
+  L += sf.alb * b.emis;
+  rays[ro] = vec4f(L, h.t);
+}
+`;
+
+export const PROBE_UPDATE_WGSL = COMMON + /* wgsl */ `
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var<storage, read> rays: array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> probeIrr: array<vec4f>;
+@group(0) @binding(3) var<storage, read_write> probeDepth: array<vec2f>;
+@group(0) @binding(4) var<storage, read_write> probeState: array<vec4i>;
+` + PROBE_FN.replace(/fn irrTexel[\s\S]*$/, '') + /* wgsl */ `
+fn pcg(v: u32) -> u32 {
+  let s = v * 747796405u + 2891336453u;
+  let w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+  return (w >> 22u) ^ w;
+}
+fn rnd(s: ptr<function, u32>) -> f32 { *s = pcg(*s); return f32(*s >> 8u) / 16777216.0; }
+fn rayRot() -> mat3x3f {
+  var s = pcg(u32(u.probeInfo.y) * 9781u + 1u);
+  let u1 = rnd(&s); let u2 = rnd(&s); let u3 = rnd(&s);
+  let q = vec4f(sqrt(1.0 - u1) * sin(6.2831853 * u2), sqrt(1.0 - u1) * cos(6.2831853 * u2),
+                sqrt(u1) * sin(6.2831853 * u3), sqrt(u1) * cos(6.2831853 * u3));
+  return mat3x3f(qrot(q, vec3f(1.0, 0.0, 0.0)), qrot(q, vec3f(0.0, 1.0, 0.0)), qrot(q, vec3f(0.0, 0.0, 1.0)));
+}
+fn sphFib(i: u32) -> vec3f {
+  let k = f32(i) + 0.5;
+  let z = 1.0 - 2.0 * k / f32(PRAYS);
+  let r = sqrt(max(1.0 - z * z, 0.0));
+  let ph = 6.2831853 * fract(k * 0.61803399);
+  return vec3f(r * cos(ph), r * sin(ph), z);
+}
+
+var<workgroup> rr: array<vec4f, 48>;
+var<workgroup> rdir: array<vec3f, 48>;
+var<workgroup> backs: atomic<u32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) li: u32) {
+  let slot = wg.x * 2u + (u32(u.probeInfo.y) & 1u);
+  if (li == 0u) { atomicStore(&backs, 0u); }
+  workgroupBarrier();
+  if (li < PRAYS) {
+    let r = rays[slot * PRAYS + li];
+    rr[li] = r;
+    rdir[li] = rayRot() * sphFib(li);
+    if (r.w < 0.0) { atomicAdd(&backs, 1u); }
+  }
+  workgroupBarrier();
+  let cell = cellOfSlot(slot);
+  let st = probeState[slot];
+  let reset = st.w == 0 || any(st.xyz != cell);
+  let hyst = select(u.probeInfo.x, 0.0, reset);
+  let sp = u.probeGrid.w;
+
+  if (li < 64u) {
+    let e = (vec2f(f32(li % 8u), f32(li / 8u)) + 0.5) / 8.0 * 2.0 - 1.0;
+    let dir = octDecode(e);
+    var sum = vec3f(0.0);
+    var ws = 0.0;
+    for (var i = 0u; i < PRAYS; i++) {
+      let w = max(dot(dir, rdir[i]), 0.0);
+      sum += w * rr[i].rgb;
+      ws += w;
+    }
+    let nw = sum / max(ws, 1e-4);
+    let old = probeIrr[slot * 64u + li].rgb;
+    // react faster to big lighting changes (blinking platforms, lights switching off)
+    var hy = hyst;
+    let dl = abs(dot(nw - old, vec3f(0.2126, 0.7152, 0.0722)));
+    if (dl > 0.6 * (dot(old, vec3f(0.2126, 0.7152, 0.0722)) + 0.1)) { hy = min(hy, 0.85); }
+    probeIrr[slot * 64u + li] = vec4f(mix(nw, old, hy), 1.0);
+  }
+  {
+    let e = (vec2f(f32(li % 16u), f32(li / 16u)) + 0.5) / 16.0 * 2.0 - 1.0;
+    let dir = octDecode(e);
+    var sum = vec2f(0.0);
+    var ws = 0.0;
+    let maxD = sp * 1.5;
+    for (var i = 0u; i < PRAYS; i++) {
+      let w = pow(max(dot(dir, rdir[i]), 0.0), 50.0);
+      if (w <= 0.0) { continue; }
+      let dd = min(abs(rr[i].w), maxD);
+      sum += w * vec2f(dd, dd * dd);
+      ws += w;
+    }
+    if (ws > 1e-5) {
+      let nw = sum / ws;
+      let old = probeDepth[slot * 256u + li];
+      probeDepth[slot * 256u + li] = mix(nw, old, select(hyst, 0.0, reset));
+    } else if (reset) {
+      probeDepth[slot * 256u + li] = vec2f(maxD, maxD * maxD);
+    }
+  }
+  workgroupBarrier();
+  if (li == 0u) {
+    // more than 25% of rays hitting back faces: the probe sits inside geometry -> disable it
+    let alive = select(1, 0, atomicLoad(&backs) * 4u > PRAYS);
+    probeState[slot] = vec4i(cell, alive);
+  }
+}
+`;
+
+export const AO_WGSL = COMMON + /* wgsl */ `
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var normalTex: texture_2d<f32>;
+@group(0) @binding(2) var depthTex: texture_depth_2d;
+@group(0) @binding(3) var aoOut: texture_storage_2d<r32float, write>;
+
+fn ndcOf(px: vec2f) -> vec2f {
+  let uv = (px + 0.5) / u.res.xy;
+  return vec2f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+}
+fn worldPos(px: vec2f, d: f32) -> vec3f {
+  let wh = u.invViewProj * vec4f(ndcOf(px), d, 1.0);
+  return wh.xyz / wh.w;
+}
+fn bayer4(p: vec2u) -> f32 {
+  let m = array<f32, 16>(0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0);
+  return (m[(p.y & 3u) * 4u + (p.x & 3u)] + 0.5) / 16.0;
+}
+
+// runs at half resolution: one AO sample per 2x2 block, upsampled by the depth-aware blur
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let hd = (vec2u(u.res.xy) + 1u) / 2u;
+  if (gid.x >= hd.x || gid.y >= hd.y) { return; }
+  let px = min(vec2i(gid.xy) * 2, vec2i(u.res.xy) - 1);
+  let d = textureLoad(depthTex, px, 0);
+  if (d <= 0.0) { textureStore(aoOut, gid.xy, vec4f(1.0)); return; }
+  let n = textureLoad(normalTex, px, 0).xyz;
+  let p = worldPos(vec2f(px), d);
+  let viewZ = 0.1 / d;
+  let R = 1.8;
+  // projected radius in pixels for a 70 deg vertical fov
+  let rpx = clamp(R * u.res.y * 0.714 / viewZ, 3.0, 90.0);
+  let jit = bayer4(gid.xy);
+  var occ = 0.0;
+  for (var di = 0; di < 4; di++) {
+    let a = (f32(di) + jit) * 0.78539816;   // pi/4 steps over a half circle, both sides
+    let dir = vec2f(cos(a), sin(a));
+    for (var side = -1.0; side <= 1.0; side += 2.0) {
+      for (var si = 0; si < 4; si++) {
+        let t = (f32(si) + fract(jit * 7.0 + f32(si) * 0.37)) / 4.0;
+        let q = vec2f(px) + dir * side * rpx * (t * t * 0.85 + 0.15);
+        if (any(q < vec2f(0.0)) || any(q >= u.res.xy)) { continue; }
+        let dq = textureLoad(depthTex, vec2i(q), 0);
+        if (dq <= 0.0) { continue; }
+        let v = worldPos(floor(q), dq) - p;
+        let l2 = dot(v, v);
+        let h = dot(n, v) * inverseSqrt(max(l2, 1e-6));
+        occ += max(h - 0.12, 0.0) * clamp(1.0 - l2 / (R * R), 0.0, 1.0);
+      }
+    }
+  }
+  let ao = clamp(1.0 - occ / 32.0 * 2.6 * u.rasterInfo.z, 0.0, 1.0);
+  textureStore(aoOut, gid.xy, vec4f(ao));
+}
+`;
+
+export const AO_BLUR_WGSL = COMMON + /* wgsl */ `
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(2) var depthTex: texture_depth_2d;
+@group(0) @binding(3) var aoIn: texture_2d<f32>;
+@group(0) @binding(4) var aoOut: texture_storage_2d<r32float, write>;
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let dims = vec2u(u.res.xy);
+  if (gid.x >= dims.x || gid.y >= dims.y) { return; }
+  let px = vec2i(gid.xy);
+  let d = textureLoad(depthTex, px, 0);
+  if (d <= 0.0) { textureStore(aoOut, px, vec4f(1.0)); return; }
+  let z = 0.1 / d;
+  var s = 0.0;
+  var ws = 0.0;
+  // 4x4 half-res taps around this pixel (= 8x8 full-res footprint): blur + bilateral upsample
+  let hp = px / 2;
+  let hmax = vec2i(textureDimensions(aoIn)) - 1;
+  for (var y = -2; y <= 1; y++) {
+    for (var x = -2; x <= 1; x++) {
+      let hq = clamp(hp + vec2i(x, y), vec2i(0), hmax);
+      let dq = textureLoad(depthTex, min(hq * 2, vec2i(dims) - 1), 0);
+      if (dq <= 0.0) { continue; }
+      let w = exp(-abs(0.1 / dq - z) / (0.03 * z + 0.02));
+      s += w * textureLoad(aoIn, hq, 0).r;
+      ws += w;
+    }
+  }
+  if (ws <= 1e-4) { textureStore(aoOut, px, vec4f(1.0)); return; }
+  textureStore(aoOut, px, vec4f(s / max(ws, 1e-4)));
+}
+`;
+
+export const LIGHT_WGSL = COMMON + SKY_FN + BRDF_FN + /* wgsl */ `
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var<storage, read> boxes: array<Box>;
+@group(0) @binding(2) var normalTex: texture_2d<f32>;
+@group(0) @binding(3) var depthTex: texture_depth_2d;
+@group(0) @binding(4) var albedoTex: texture_2d<f32>;
+@group(0) @binding(5) var shadowMap: texture_depth_2d_array;
+@group(0) @binding(6) var shadowSamp: sampler_comparison;
+@group(0) @binding(7) var<storage, read> probeIrr: array<vec4f>;
+@group(0) @binding(8) var<storage, read> probeDepth: array<vec2f>;
+@group(0) @binding(9) var<storage, read> probeState: array<vec4i>;
+@group(0) @binding(10) var<storage, read> lights: array<Light>;
+@group(0) @binding(11) var aoTex: texture_2d<f32>;
+@group(0) @binding(12) var hdrPrev: texture_2d<f32>;
+@group(0) @binding(13) var linSamp: sampler;
+@group(0) @binding(14) var hdrOut: texture_storage_2d<rgba16float, write>;
+` + PROBE_FN + LIGHTS_FN + SHADOW_FN + FOG_FN + /* wgsl */ `
+fn ndcOf(px: vec2f) -> vec2f {
+  let uv = (px + 0.5) / u.res.xy;
+  return vec2f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+}
+fn worldPos(px: vec2f, d: f32) -> vec3f {
+  let wh = u.invViewProj * vec4f(ndcOf(px), d, 1.0);
+  return wh.xyz / wh.w;
+}
+fn ign(p: vec2f) -> f32 { return fract(52.9829189 * fract(dot(p, vec2f(0.06711056, 0.00583715)))); }
+
+fn hash2(p: vec2f) -> f32 { return fract(sin(dot(p, vec2f(127.1, 311.7))) * 43758.5453); }
+fn vnoise(p: vec2f) -> f32 {
+  let i = floor(p);
+  let f = fract(p);
+  let w = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash2(i), hash2(i + vec2f(1.0, 0.0)), w.x),
+             mix(hash2(i + vec2f(0.0, 1.0)), hash2(i + vec2f(1.0, 1.0)), w.x), w.y);
+}
+// Animated lava: slow-drifting cooled crust plates separated by glowing, pulsing cracks.
+struct Lava { alb: vec3f, emis: vec3f };
+fn lavaSurface(p: vec2f, t: f32) -> Lava {
+  var q = p * 0.07;
+  let warp = vec2f(vnoise(q * 1.7 + t * 0.05), vnoise(q * 1.7 - t * 0.04 + 7.3));
+  q += (warp - 0.5) * 1.4;
+  var f = 0.0;
+  var a = 0.5;
+  var qq = q + vec2f(t * 0.018, t * 0.011);
+  for (var i = 0; i < 4; i++) { f += a * vnoise(qq); qq = qq * 2.03 + 1.7; a *= 0.5; }
+  let crack = 1.0 - smoothstep(0.02, 0.11, abs(f - 0.5));
+  let pulse = 0.75 + 0.25 * sin(t * 1.3 + f * 12.0);
+  let heat = clamp(crack * pulse + smoothstep(0.62, 0.9, f) * 0.35, 0.0, 1.0);
+  let hot = mix(vec3f(1.0, 0.07, 0.0), vec3f(1.0, 0.42, 0.04), heat * heat) * (0.12 + 4.0 * heat * heat);
+  return Lava(mix(vec3f(0.035, 0.022, 0.02), vec3f(0.2, 0.05, 0.02), heat), hot);
+}
+
+// Screen-space reflection: march the reflected ray in clip space against the depth buffer,
+// refine with a binary search, then fetch last frame's final colour at the reprojected hit.
+fn ssr(p: vec3f, r: vec3f, jit: f32) -> vec4f {
+  let maxD = 60.0;
+  var e = p + r * maxD;
+  let h0 = u.viewProj * vec4f(p, 1.0);
+  var h1 = u.viewProj * vec4f(e, 1.0);
+  if (h1.w < 0.2) {                        // clip the ray in front of the camera
+    let t = (h0.w - 0.2) / max(h0.w - h1.w, 1e-4);
+    e = p + r * maxD * t;
+    h1 = u.viewProj * vec4f(e, 1.0);
+  }
+  let STEPS = 40;
+  var prevT = 0.0;
+  var hitT = -1.0;
+  for (var i = 1; i <= STEPS; i++) {
+    let t = (f32(i) - 1.0 + jit) / f32(STEPS);
+    let tt = t * t;                       // more samples near the surface
+    let hc = mix(h0, h1, tt);
+    let ndc = hc.xy / hc.w;
+    if (any(abs(ndc) > vec2f(1.0))) { break; }
+    let px = vec2i((vec2f(ndc.x, -ndc.y) * 0.5 + 0.5) * u.res.xy);
+    let ds = textureLoad(depthTex, px, 0);
+    if (ds <= 0.0) { prevT = tt; continue; }
+    let sz = 0.1 / ds;
+    let rz = hc.w;
+    if (rz > sz + 0.03 && rz - sz < 0.6 + 0.03 * rz) { hitT = tt; break; }
+    prevT = tt;
+  }
+  if (hitT < 0.0) { return vec4f(0.0); }
+  var lo = prevT;
+  var hi = hitT;
+  for (var k = 0; k < 5; k++) {
+    let m = 0.5 * (lo + hi);
+    let hc = mix(h0, h1, m);
+    let ndc = hc.xy / hc.w;
+    let px = vec2i((vec2f(ndc.x, -ndc.y) * 0.5 + 0.5) * u.res.xy);
+    let ds = textureLoad(depthTex, px, 0);
+    if (ds > 0.0 && hc.w > 0.1 / ds) { hi = m; } else { lo = m; }
+  }
+  let hc = mix(h0, h1, hi);
+  let ndc = hc.xy / hc.w;
+  let hp = vec2i((vec2f(ndc.x, -ndc.y) * 0.5 + 0.5) * u.res.xy);
+  let hn = textureLoad(normalTex, hp, 0).xyz;
+  if (dot(hn, r) > 0.1) { return vec4f(0.0); }     // hit a back face
+  let wh = worldPos(vec2f(hp), textureLoad(depthTex, hp, 0));
+  let pc = u.prevViewProj * vec4f(wh, 1.0);
+  if (pc.w <= 0.0) { return vec4f(0.0); }
+  let puv = vec2f(pc.x / pc.w * 0.5 + 0.5, 0.5 - pc.y / pc.w * 0.5);
+  if (any(puv < vec2f(0.0)) || any(puv > vec2f(1.0))) { return vec4f(0.0); }
+  let edge = smoothstep(0.0, 0.08, min(min(puv.x, 1.0 - puv.x), min(puv.y, 1.0 - puv.y)));
+  let fade = edge * (1.0 - smoothstep(0.7, 1.0, hi));
+  return vec4f(textureSampleLevel(hdrPrev, linSamp, puv, 0.0).rgb, fade);
+}
+
+// Tiled light culling (8x8 pixels): the tile's world-space bounds are reduced in shared memory,
+// every light is tested once per tile, and pixels only loop over the survivors.
+var<workgroup> tMin: array<vec3f, 64>;
+var<workgroup> tMax: array<vec3f, 64>;
+var<workgroup> tileLights: array<u32, 64>;
+var<workgroup> tileCount: atomic<u32>;
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_index) li: u32) {
+  let dims = vec2u(u.res.xy);
+  let inside = gid.x < dims.x && gid.y < dims.y;
+  let px = vec2i(min(gid.xy, dims - 1u));
+  let cam = u.camPos.xyz;
+  let d = textureLoad(depthTex, px, 0);
+  let wp = worldPos(vec2f(px), max(d, 1e-6));
+  let geo = inside && d > 0.0;
+  tMin[li] = select(vec3f(1e9), wp, geo);
+  tMax[li] = select(vec3f(-1e9), wp, geo);
+  if (li == 0u) { atomicStore(&tileCount, 0u); }
+  workgroupBarrier();
+  for (var st = 32u; st > 0u; st >>= 1u) {
+    if (li < st) {
+      tMin[li] = min(tMin[li], tMin[li + st]);
+      tMax[li] = max(tMax[li], tMax[li + st]);
+    }
+    workgroupBarrier();
+  }
+  let bmin = tMin[0];
+  let bmax = tMax[0];
+  let cnt = u32(u.probeInfo.z);
+  for (var i = li; i < cnt; i += 64u) {
+    let L = lights[i];
+    let q = clamp(L.p, bmin, bmax);
+    if (dot(q - L.p, q - L.p) < L.radius * L.radius) {
+      let k = atomicAdd(&tileCount, 1u);
+      if (k < 64u) { tileLights[k] = i; }
+    }
+  }
+  workgroupBarrier();
+  let nTile = min(atomicLoad(&tileCount), 64u);
+  if (!inside) { return; }
+  if (d <= 0.0) {
+    let fp = worldPos(vec2f(px), 1e-6);
+    textureStore(hdrOut, px, vec4f(sky(normalize(fp - cam)) * u.rasterInfo.w, 1.0));
+    return;
+  }
+  let nt = textureLoad(normalTex, px, 0);
+  let n = normalize(nt.xyz);
+  let id = u32(nt.w + 0.5);
+  var alb = textureLoad(albedoTex, px, 0).rgb;
+  let b = boxes[id];
+  let mtl = matOf(b);
+  let mt = matParams(mtl);
+  let isLava = mtl == M_NEON && b.h.x > 300.0;
+  var lava = Lava(vec3f(0.0), vec3f(0.0));
+  if (isLava) { lava = lavaSurface(wp.xz, u.camPos.w); alb = lava.alb; }
+  let v = normalize(cam - wp);
+  let viewZ = 0.1 / d;
+  let nv = max(dot(n, v), 1e-4);
+  let noise = ign(vec2f(px) + f32(u32(u.sunDir.w) % 64u) * 5.588238);
+  let ao = textureLoad(aoTex, px, 0).r;
+
+  // direct: sun with soft shadows + hand-placed lights
+  let L = u.sunDir.xyz;
+  var col = vec3f(0.0);
+  let ndl = dot(n, L);
+  if (ndl > 0.0) {
+    col += brdf(n, v, L, alb, mt) * SUN_COL * ndl * sunShadow(wp, n, viewZ, noise);
+  }
+  for (var k = 0u; k < nTile; k++) { col += shadeLight(lights[tileLights[k]], wp, n, v, alb, mt); }
+
+  // indirect diffuse from the DDGI probes, with multi-bounce AO (Jimenez et al. 2016)
+  let f0 = mix(vec3f(0.04), alb, mt.metal);
+  let Fe = envBRDF(f0, nv, mt.rough);
+  let r = reflect(-v, n);
+  let ph = probeLookup2(wp, n, v, r, true);
+  let irr = ph.irr;
+  let ca = 2.0404 * alb - 0.3324;
+  let cb = -4.7951 * alb + 0.6417;
+  let cc = 2.7552 * alb + 0.6903;
+  let aoMB = max(vec3f(ao), ((ao * ca + cb) * ao + cc) * ao);
+  col += alb * irr * aoMB * (1.0 - mt.metal) * (1.0 - Fe);
+
+  // indirect specular: SSR over a probe / sky fallback, with specular occlusion
+  let skyVis = skyVisibility(wp + n * 0.3, r);
+  var env = skyDiffuse(r);
+  if (ph.w > 1e-5) { env = mix(ph.refl, env, skyVis); }
+  if (mt.rough < 0.12 && skyVis > 0.5) { env = mix(env, sky(r), (skyVis - 0.5) * 2.0); }
+  if (u.rasterInfo.y > 0.5 && mt.rough < 0.3) {
+    let s = ssr(wp + n * 0.03, r, noise);
+    env = mix(env, s.rgb / max(u.rasterInfo.w, 1e-3), s.a * (1.0 - mt.rough / 0.3));
+  }
+  let specOcc = clamp(pow(nv + ao, exp2(-16.0 * mt.rough - 1.0)) - 1.0 + ao, 0.0, 1.0);
+  col += env * Fe * specOcc;
+
+  if (isLava) {
+    col += lava.emis;
+  } else if (mtl == M_NEON) {
+    // emissive parts are light sources: mostly their own glow, only a hint of surface lighting
+    col = col * 0.2 + alb * b.emis * 0.95;
+  } else {
+    col += alb * b.emis;
+  }
+  col = heightFog(col, wp, cam);
+  textureStore(hdrOut, px, vec4f(col * u.rasterInfo.w, 1.0));
+}
+`;
+
+export const TRANSPARENT_WGSL = COMMON + SKY_FN + BRDF_FN + BOX_VS_FN + /* wgsl */ `
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var<storage, read> boxes: array<Box>;
+@group(0) @binding(2) var shadowMap: texture_depth_2d_array;
+@group(0) @binding(3) var shadowSamp: sampler_comparison;
+@group(0) @binding(4) var<storage, read> probeIrr: array<vec4f>;
+@group(0) @binding(5) var<storage, read> probeDepth: array<vec2f>;
+@group(0) @binding(6) var<storage, read> probeState: array<vec4i>;
+@group(0) @binding(7) var<storage, read> lights: array<Light>;
+` + PROBE_FN + LIGHTS_FN + SHADOW_FN + FOG_FN + /* wgsl */ `
+struct VO {
+  @builtin(position) pos: vec4f,
+  @location(0) wp: vec3f,
+  @location(1) @interpolate(flat) n: vec3f,
+  @location(2) @interpolate(flat) id: u32,
+};
+
+@vertex fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VO {
+  let b = boxes[ii];
+  let m = matOf(b);
+  var o: VO;
+  let w = boxCorner(b, vi);
+  o.pos = u.viewProj * vec4f(w[0], 1.0);
+  if (m != M_GLASS && m != M_GHOST) { o.pos = vec4f(2.0, 2.0, 2.0, 1.0); }
+  o.wp = w[0];
+  o.n = w[1];
+  o.id = ii;
+  return o;
+}
+
+@fragment fn fs(i: VO) -> @location(0) vec4f {
+  let cam = u.camPos.xyz;
+  let v = normalize(cam - i.wp);
+  let n = i.n;
+  if (dot(n, v) <= 0.0) { discard; }         // front faces only
+  let b = boxes[i.id];
+  let ghost = matOf(b) == M_GHOST;
+  let tint = select(b.col, mix(b.col, vec3f(1.0), 0.4), ghost);
+  let mt = Mat(0.03, 0.0);
+  let nv = max(dot(n, v), 1e-4);
+  let F = fSchlick(vec3f(0.04), nv).x;
+  let viewZ = (u.viewProj * vec4f(i.wp, 1.0)).w;
+  let L = u.sunDir.xyz;
+  // thin tinted body: lit by sun, lights and probes
+  let body = select(0.22, 0.14, ghost);
+  let r = reflect(-v, n);
+  let ph = probeLookup2(i.wp, n, v, r, true);
+  var lit = ph.irr;
+  let ndl = dot(n, L);
+  if (ndl > 0.0) { lit += SUN_COL * ndl * sunShadow(i.wp, n, viewZ, 0.5); }
+  lit += localLights(i.wp, n, v, vec3f(1.0), Mat(0.6, 0.0));
+  var c = tint * lit * body;
+  // reflection of the environment + the sun glint
+  var env = skyDiffuse(r);
+  if (ph.w > 1e-5) { env = mix(ph.refl, sky(r), skyVisibility(i.wp + n * 0.3, r)); }
+  c += env * F;
+  if (ndl > 0.0) {
+    let h = normalize(v + L);
+    c += SUN_COL * pow(max(dot(n, h), 0.0), 600.0) * 4.0 * F;
+  }
+  if (ghost) { c += tint * 0.12 * (0.5 + 0.5 * sin(u.camPos.w * 6.0)); }
+  let a = clamp(body + F, 0.0, 1.0);
+  let fogged = heightFog(c / max(a, 1e-3), i.wp, cam) * a;
+  return vec4f(fogged * u.rasterInfo.w, a);
+}
+`;
+
+// Dual-filter bloom (Jimenez, "Next Generation Post Processing in Call of Duty: AW").
+export const BLOOM_DOWN_WGSL = /* wgsl */ `
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var dst: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(3) var<uniform> prm: vec4f;   // x = first level (Karis average)
+
+fn lum(c: vec3f) -> f32 { return dot(c, vec3f(0.2126, 0.7152, 0.0722)); }
+fn S(uv: vec2f) -> vec3f { return min(textureSampleLevel(src, samp, uv, 0.0).rgb, vec3f(64.0)); }
+fn kw(c: vec3f) -> f32 { return 1.0 / (1.0 + lum(c)); }
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let dd = textureDimensions(dst);
+  if (gid.x >= dd.x || gid.y >= dd.y) { return; }
+  let uv = (vec2f(gid.xy) + 0.5) / vec2f(dd);
+  let ts = 1.0 / vec2f(textureDimensions(src));
+  let a = S(uv + ts * vec2f(-2.0, -2.0)); let b = S(uv + ts * vec2f(0.0, -2.0)); let c = S(uv + ts * vec2f(2.0, -2.0));
+  let d = S(uv + ts * vec2f(-1.0, -1.0)); let e = S(uv + ts * vec2f(1.0, -1.0));
+  let f = S(uv + ts * vec2f(-2.0, 0.0)); let g = S(uv); let h = S(uv + ts * vec2f(2.0, 0.0));
+  let i = S(uv + ts * vec2f(-1.0, 1.0)); let j = S(uv + ts * vec2f(1.0, 1.0));
+  let k = S(uv + ts * vec2f(-2.0, 2.0)); let l = S(uv + ts * vec2f(0.0, 2.0)); let m = S(uv + ts * vec2f(2.0, 2.0));
+  var o: vec3f;
+  if (prm.x > 0.5) {
+    // Karis average per 2x2 group kills fireflies on the first downsample
+    let g0 = (d + e + i + j) * 0.25; let g1 = (a + b + f + g) * 0.25; let g2 = (b + c + g + h) * 0.25;
+    let g3 = (f + g + k + l) * 0.25; let g4 = (g + h + l + m) * 0.25;
+    let w0 = kw(g0) * 0.5; let w1 = kw(g1) * 0.125; let w2 = kw(g2) * 0.125; let w3 = kw(g3) * 0.125; let w4 = kw(g4) * 0.125;
+    o = (g0 * w0 + g1 * w1 + g2 * w2 + g3 * w3 + g4 * w4) / (w0 + w1 + w2 + w3 + w4);
+  } else {
+    o = (d + e + i + j) * 0.125 + (a + b + f + g) * 0.03125 + (b + c + g + h) * 0.03125
+      + (f + g + k + l) * 0.03125 + (g + h + l + m) * 0.03125;
+  }
+  textureStore(dst, gid.xy, vec4f(o, 1.0));
+}
+`;
+
+export const BLOOM_UP_WGSL = /* wgsl */ `
+@group(0) @binding(0) var low: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var cur: texture_2d<f32>;
+@group(0) @binding(3) var dst: texture_storage_2d<rgba16float, write>;
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let dd = textureDimensions(dst);
+  if (gid.x >= dd.x || gid.y >= dd.y) { return; }
+  let uv = (vec2f(gid.xy) + 0.5) / vec2f(dd);
+  let ts = 1.0 / vec2f(textureDimensions(low));
+  var t = textureSampleLevel(low, samp, uv, 0.0).rgb * 4.0;
+  t += (textureSampleLevel(low, samp, uv + vec2f(-ts.x, 0.0), 0.0).rgb + textureSampleLevel(low, samp, uv + vec2f(ts.x, 0.0), 0.0).rgb
+      + textureSampleLevel(low, samp, uv + vec2f(0.0, -ts.y), 0.0).rgb + textureSampleLevel(low, samp, uv + vec2f(0.0, ts.y), 0.0).rgb) * 2.0;
+  t += textureSampleLevel(low, samp, uv - ts, 0.0).rgb + textureSampleLevel(low, samp, uv + ts, 0.0).rgb
+     + textureSampleLevel(low, samp, uv + vec2f(ts.x, -ts.y), 0.0).rgb + textureSampleLevel(low, samp, uv + vec2f(-ts.x, ts.y), 0.0).rgb;
+  let c = textureLoad(cur, gid.xy, 0).rgb;
+  textureStore(dst, gid.xy, vec4f(c + t / 16.0, 1.0));
 }
 `;
