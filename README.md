@@ -2,6 +2,8 @@
 
 A Roblox-style obstacle course running in the browser, with three renderers: a production-style **raster lighting** pipeline (default), **hybrid ray tracing**, and **ReSTIR PT Enhanced** path tracing.
 
+**[Playtest the live game](https://nilav123.github.io/neon-obby/)** in a WebGPU-capable browser.
+
 - **Rust → WebAssembly** game core (no wasm-bindgen): level, physics, R6-style character rig, and a BVH rebuilt every frame.
 - **Raster lighting** (default; how a shipped game lights a scene — no per-pixel ray tracing):
   - **Hand-placed lights**: 40 point lights authored in the Rust level (neon letters, hazard glows that ride on spinners and sliders, checkpoint pads, uplights, under-glass fills, the win arch), with **tiled light culling** (8×8 tiles, world-space tile bounds reduced in shared memory).
