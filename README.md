@@ -26,10 +26,15 @@ A Roblox-style obstacle course running in the browser, with three renderers: a p
   4. Shade pass (compute) → temporal accumulation with variance clamping, GI upsample, traced mirror/metal reflections and glass transmission
   5. Post → ACES tonemap
 
+## Asynchronous reprojection (timewarp)
+Press `F` to separate the display rate from the render rate. A second WebGPU device does only one thing: every display refresh it warps the newest finished frame to the current camera. It unprojects each pixel with that frame's depth and inverse view-projection, reprojects it with the latest camera, and solves for the inverse with a 6-step fixed-point iteration. The scene device renders at its own pace, with a 1.2× field-of-view overscan so fast turns don't expose edges. Each finished colour and depth frame is handed to the presenting device through a mapped staging buffer.
+
+Because the presenting device's queue never waits behind a 60–100 ms path-traced frame, camera motion stays at display rate (60 fps while ReSTIR PT renders at about 15). `V` caps the scene rate so you can see the effect. Known limitations: there are no motion vectors, so moving objects such as the player judder at the scene rate, and disocclusions stretch. If a second device isn't available, the warp runs on the scene device; that path is correct but gives no async benefit.
+
 Needs a WebGPU browser (Chrome/Edge, Safari 26+).
 
 ## Controls
-`WASD` move · `Space` jump · mouse / right-drag look · wheel zoom · `R` raster lighting ↔ ray tracing · `P` (in ray tracing) ReSTIR PT Enhanced ↔ hybrid · `G` render scale · `K` respawn · `T` restart · `H` hide help
+`WASD` move · `Space` jump · mouse / right-drag look · wheel zoom · `R` raster lighting ↔ ray tracing · `P` (in ray tracing) ReSTIR PT Enhanced ↔ hybrid · `G` render scale · `F` asynchronous reprojection · `V` cycle scene fps cap (∞/30/15/8) · `K` respawn · `T` restart · `H` hide help
 
 ## Build
 ```sh

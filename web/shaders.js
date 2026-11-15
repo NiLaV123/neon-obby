@@ -2446,3 +2446,52 @@ fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_ind
 }
 `;
 
+
+// Asynchronous reprojection ("timewarp"): presents the last finished scene frame from the
+// *current* camera every display refresh. Backward warp: for each output pixel, a few fixed-point
+// iterations find the source pixel whose depth-reconstructed world point lands here (handles
+// camera rotation and translation; the sky, at infinite depth, warps as pure rotation).
+// DEPTH_DECL / DEPTH_LOAD are patched for a depth32float (same device) or r32float (2nd device) source.
+export const WARP_WGSL = /* wgsl */ `
+struct WU { newVP: mat4x4f, oldInvVP: mat4x4f, info: vec4f };   // info.xy = depth size
+@group(0) @binding(0) var<uniform> wu: WU;
+@group(0) @binding(1) var src: texture_2d<f32>;
+DEPTH_DECL
+@group(0) @binding(3) var samp: sampler;
+
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+  return vec4f(p * 2.0 - 1.0, 0.0, 1.0);
+}
+
+fn depthAt(uv: vec2f) -> f32 {
+  let dp = clamp(vec2i(uv * wu.info.xy), vec2i(0), vec2i(wu.info.xy) - 1);
+  return DEPTH_LOAD;
+}
+fn warpTo(s: vec2f) -> vec3f {   // where source uv s lands on screen now (z = 1 if in front)
+  let d = depthAt(s);
+  let P = wu.oldInvVP * vec4f(s.x * 2.0 - 1.0, 1.0 - s.y * 2.0, d, 1.0);
+  let c = wu.newVP * P;
+  if (c.w <= 1e-6) { return vec3f(0.0); }
+  return vec3f(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5, 1.0);
+}
+
+@fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+  let size = vec2f(textureDimensions(src));
+  let outSize = wu.info.zw;
+  let uv = fc.xy / outSize;
+  var s = uv;
+  for (var i = 0; i < 6; i++) {
+    let w = warpTo(clamp(s, vec2f(0.0), vec2f(1.0)));
+    if (w.z == 0.0) { break; }
+    s += uv - w.xy;
+  }
+  let inside = all(s >= vec2f(0.0)) && all(s <= vec2f(1.0));
+  var c = textureSampleLevel(src, samp, clamp(s, vec2f(0.5) / size, vec2f(1.0) - vec2f(0.5) / size), 0.0).rgb;
+  if (!inside) {   // beyond the overscan border: stretch the edge, slightly darkened
+    let o = max(max(-s, s - 1.0), vec2f(0.0));
+    c *= 1.0 - clamp(length(o) * 4.0, 0.0, 0.5);
+  }
+  return vec4f(c, 1.0);
+}
+`;
