@@ -1,5 +1,5 @@
 import { RASTER_WGSL, TRACE_WGSL, PT_TEMPORAL_WGSL, PT_PREPASS_WGSL, PT_RESAMPLE_WGSL, PT_DUP_WGSL, DN_ACCUM_WGSL, DN_ATROUS_WGSL, SHADE_WGSL, POST_WGSL,
-  SHADOW_WGSL, PROBE_TRACE_WGSL, PROBE_UPDATE_WGSL, AO_WGSL, AO_BLUR_WGSL, LIGHT_WGSL, TRANSPARENT_WGSL, BLOOM_DOWN_WGSL, BLOOM_UP_WGSL } from './shaders.js';
+  SHADOW_WGSL, PROBE_TRACE_WGSL, PROBE_UPDATE_WGSL, AO_WGSL, AO_BLUR_WGSL, LIGHT_WGSL, TRANSPARENT_WGSL, BLOOM_DOWN_WGSL, BLOOM_UP_WGSL, WARP_WGSL } from './shaders.js';
 import { SoundLibrary, MovementSounds } from './audio.js';
 
 const $ = (id) => document.getElementById(id);
@@ -108,6 +108,16 @@ async function main() {
   device.lost.then((i) => fail('GPU device lost: ' + i.message));
   let gpuErrs = 0;
   device.addEventListener('uncapturederror', (e) => { (window.__gpuErrs ||= []).push(e.error.message); if (gpuErrs++ === 0) fail('GPU error: ' + e.error.message); });
+  // A second, independent device only presents (asynchronous reprojection): its queue doesn't
+  // wait behind a long path-traced frame on the scene device. Falls back to the scene device.
+  let pdev = null;
+  try {
+    const a2 = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+    if (a2) pdev = await a2.requestDevice();
+  } catch { pdev = null; }
+  const twoDev = !!pdev;
+  if (!pdev) pdev = device;
+  if (twoDev) pdev.addEventListener('uncapturederror', (e) => fail('GPU error (present device): ' + e.error.message));
   const ctx = canvas.getContext('webgpu');
   const format = navigator.gpu.getPreferredCanvasFormat();
   ctx.configure({ device, format, alphaMode: 'opaque' });
@@ -225,6 +235,22 @@ async function main() {
     return b;
   });
   const BLOOM_LEVELS = 6;
+
+  // ---- asynchronous reprojection (timewarp) on the present device
+  const warpCode = WARP_WGSL
+    .replace('DEPTH_DECL', twoDev ? '@group(0) @binding(2) var srcDepth: texture_2d<f32>;' : '@group(0) @binding(2) var srcDepth: texture_depth_2d;')
+    .replace('DEPTH_LOAD', twoDev ? 'textureLoad(srcDepth, dp, 0).r' : 'textureLoad(srcDepth, dp, 0)');
+  const warpMod = pdev.createShaderModule({ code: warpCode, label: 'warp' });
+  const warpPipe = pdev.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module: warpMod, entryPoint: 'vs' },
+    fragment: { module: warpMod, entryPoint: 'fs', targets: [{ format }] },
+    primitive: { topology: 'triangle-list' },
+  });
+  const warpUni = pdev.createBuffer({ size: 36 * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const warpSamp = pdev.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+  const OVERSCAN = 1.2;   // async mode renders a wider field of view so fast turns don't show edges
+  let warp = null;        // per-resize: source textures, staging buffers, bind groups
   const RASTER_EXPOSURE = 0.62; // hand-tuned: keeps sunlit plastic around 0.8 after ACES
 
   const dnDummy = device.createTexture({ size: [1, 1], format: 'rgba16float', usage: GPUTextureUsage.STORAGE_BINDING }).createView();
@@ -297,7 +323,7 @@ async function main() {
   const PAIR_SIGMA = Math.sqrt(8 / (9 * Math.PI)) * 20;
   const pairTex = [254, 230, 210].map((sz) => makePairTexture(sz, PAIR_SIGMA, rand));
 
-  let W = 0, H = 0, tex = null, views = null, bufs = null, renderScale = 0.75, clearPT = true;
+  let CW = 0, CH = 0, W = 0, H = 0, tex = null, views = null, bufs = null, renderScale = 0.75, clearPT = true;
   let BG = null, bloomPasses = []; // per-parity bind groups, bloom chain
   const RT = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING;
   const ST = GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING;
@@ -312,15 +338,16 @@ async function main() {
     let sc = renderScale;
     if (rtOn && ptOn) sc = Math.min(sc, Math.sqrt(PT_PIXEL_BUDGET * (renderScale / 0.75) ** 2 / (cw * ch)));
     const nw = Math.max(1, Math.floor(cw * sc)), nh = Math.max(1, Math.floor(ch * sc));
-    if (nw === W && nh === H && tex) return;
-    W = nw; H = nh;
+    if (nw === W && nh === H && cw === CW && ch === CH && tex) return;
+    W = nw; H = nh; CW = cw; CH = ch;
+    if (warp) { for (const t of warp.own) t.destroy(); warp = null; }
     if (tex) for (const t of Object.values(tex)) t.destroy();
     if (bufs) for (const b of Object.values(bufs)) b.destroy();
     const mk = (f, u) => device.createTexture({ size: [W, H], format: f, usage: u });
     // G-buffers ping-pong so the temporal pass can see last frame's primary hits
     tex = {
-      albedo0: mk('rgba8unorm', RT), normal0: mk('rgba16float', RT), depth0: mk('depth32float', RT),
-      albedo1: mk('rgba8unorm', RT), normal1: mk('rgba16float', RT), depth1: mk('depth32float', RT),
+      albedo0: mk('rgba8unorm', RT), normal0: mk('rgba16float', RT), depth0: mk('depth32float', RT | GPUTextureUsage.COPY_SRC),
+      albedo1: mk('rgba8unorm', RT), normal1: mk('rgba16float', RT), depth1: mk('depth32float', RT | GPUTextureUsage.COPY_SRC),
       hist0: mk('rgba16float', ST), hist1: mk('rgba16float', ST), hdr: mk('rgba16float', ST | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC),
       raw: mk('rgba16float', ST), pt: mk('rgba16float', ST),
       aoRaw: device.createTexture({ size: [Math.max(1, (W + 1) >> 1), Math.max(1, (H + 1) >> 1)], format: 'r32float', usage: ST }), ao: mk('r32float', ST),
@@ -334,6 +361,10 @@ async function main() {
     const levels = Math.min(BLOOM_LEVELS, Math.floor(Math.log2(Math.max(1, Math.min(bw, bh)))) + 1);
     const mkPyr = () => device.createTexture({ size: [bw, bh], format: 'rgba16float', mipLevelCount: levels, usage: ST });
     tex.bloomD = mkPyr(); tex.bloomU = mkPyr();
+    // finished frames for the timewarp (canvas resolution, ping-pong so a frame is never overwritten
+    // while it is still being presented)
+    const mkLdr = () => device.createTexture({ size: [CW, CH], format, usage: RT | GPUTextureUsage.COPY_SRC });
+    tex.ldr0 = mkLdr(); tex.ldr1 = mkLdr();
     const n = W * H, SB = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
     const mb = (bytes) => device.createBuffer({ size: bytes, usage: SB });
     // two 64-byte reservoir sets (paper: 2 x 64 B / pixel), paired-shift results, dup map
@@ -373,6 +404,24 @@ async function main() {
       });
     }
     const bloomOut = levels > 1 ? bU[0] : bD[0];
+    {
+      const cbpr = Math.ceil(CW * 4 / 256) * 256, dbpr = Math.ceil(W * 4 / 256) * 256;
+      const wbg = (srcView, depthView) => pdev.createBindGroup({
+        layout: warpPipe.getBindGroupLayout(0),
+        entries: [{ binding: 0, resource: { buffer: warpUni } }, { binding: 1, resource: srcView },
+          { binding: 2, resource: depthView }, { binding: 3, resource: warpSamp }],
+      });
+      if (twoDev) {
+        const sc = pdev.createTexture({ size: [CW, CH], format, usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+        const sd = pdev.createTexture({ size: [W, H], format: 'r32float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+        const stC = device.createBuffer({ size: cbpr * CH, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+        const stD = device.createBuffer({ size: dbpr * H, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+        const g = wbg(sc.createView(), sd.createView());
+        warp = { own: [sc, sd], sc, sd, stC, stD, cbpr, dbpr, bg: [g, g] };
+      } else {
+        warp = { own: [], cbpr, dbpr, bg: [wbg(v.ldr0, v.depth0), wbg(v.ldr1, v.depth1)] };
+      }
+    }
     BG = [0, 1].map((i) => {
       const cur = { albedo: i ? v.albedo1 : v.albedo0, normal: i ? v.normal1 : v.normal0, depth: i ? v.depth1 : v.depth0 };
       const prev = { albedo: i ? v.albedo0 : v.albedo1, normal: i ? v.normal0 : v.normal1, depth: i ? v.depth0 : v.depth1 };
@@ -518,11 +567,13 @@ async function main() {
     if (e.code === 'KeyR') { rtOn = !rtOn; clearPT = true; flashMsg(rtOn ? (ptOn ? 'ReSTIR PT Enhanced' : 'Hybrid ray tracing') : 'Raster lighting: probes + lights + shadow maps'); }
     if (e.code === 'KeyP') { ptOn = !ptOn; clearPT = true; flashMsg(ptOn ? 'ReSTIR PT Enhanced ON' : 'Hybrid RT: traced shadows + reflections, probe GI, lights'); }
     if (e.code === 'KeyG') { scaleIdx = (scaleIdx + 1) % SCALES.length; renderScale = SCALES[scaleIdx]; flashMsg(`Render scale ${Math.round(renderScale * 100)}%`); }
+    if (e.code === 'KeyF') { setAsync(!asyncOn); flashMsg(asyncOn ? `Async reprojection ON${twoDev ? '' : ' (single device)'}` : 'Async reprojection OFF'); }
+    if (e.code === 'KeyV') { capIdx = (capIdx + 1) % SCENE_CAPS.length; flashMsg(SCENE_CAPS[capIdx] ? `Scene capped at ${SCENE_CAPS[capIdx]} fps` : 'Scene uncapped'); }
     if (e.code === 'KeyK') { w.respawn(); movementSounds.reset(); if (playing) sounds.play('respawn'); }
     if (e.code === 'KeyT') { w.restart(); movementSounds.reset(); if (playing) sounds.play('restart'); $('win').style.display = 'none'; }
     if (e.code === 'KeyH') $('help').classList.toggle('hidden');
     if (e.code === 'KeyM') toggleSound();
-    if (playing && ['KeyR', 'KeyP', 'KeyG', 'KeyH'].includes(e.code)) sounds.play('toggle');
+    if (playing && ['KeyR', 'KeyP', 'KeyG', 'KeyF', 'KeyV', 'KeyH'].includes(e.code)) sounds.play('toggle');
   });
   addEventListener('keyup', (e) => keys.delete(e.code));
   addEventListener('blur', () => { keys.clear(); sounds.stopAll(); movementSounds.reset(); });
@@ -559,42 +610,8 @@ async function main() {
 
   function fmtTime(t) { const m = Math.floor(t / 60), s = (t % 60).toFixed(2).padStart(5, '0'); return `${m}:${s}`; }
 
-  // At most 2 frames queued on the GPU; otherwise a slow path-traced frame lets the queue grow
-  // without bound and the page freezes behind it.
-  let inFlight = 0, gpuMs = 0;
-  function tick(now) {
-    if (inFlight >= 2) { requestAnimationFrame(tick); return; }
-    const dt = Math.min((now - last) / 1000, 0.1); last = now;
-    fpsAcc += dt; fpsN++;
-    if (fpsAcc > 0.5) { fps = fpsN / fpsAcc; fpsAcc = 0; fpsN = 0; }
-    resize();
-
-    const k = (c) => (keys.has(c) ? 1 : 0);
-    const mz = playing ? k('KeyW') + k('ArrowUp') - k('KeyS') - k('ArrowDown') : 0;
-    const mx = playing ? k('KeyD') + k('ArrowRight') - k('KeyA') - k('ArrowLeft') : 0;
-    const jump = playing ? k('Space') : 0;
-    if (!playing) yaw += dt * 0.08; // idle orbit behind the title card
-    w.frame(dt, mx, mz, jump, yaw, pitch, dist);
-
+  function renderScene(now, eye, target, outView, fovY, beforeSubmit) {
     const mem = w.memory.buffer;
-    const out = new Float32Array(mem, w.out_ptr(), 32);
-    const eye = [out[0], out[1], out[2]], target = [out[3], out[4], out[5]];
-    const ev = out[13];
-    if (ev & 1) flashMsg(`Checkpoint! Stage ${out[9]}`);
-    if (ev & 2) flash = 1;
-    if (ev & 4) { $('win').style.display = 'flex'; $('wintime').textContent = fmtTime(out[12]); $('windeaths').textContent = out[11]; }
-    if (playing) {
-      // Death/win take priority over incidental sounds from the same physics frame.
-      if (ev & 2) sounds.play('death');
-      else if (ev & 4) sounds.play('win');
-      else {
-        if (ev & 1) sounds.play('checkpoint');
-        if (ev & 8) sounds.play('jump');
-        if (ev & 16) sounds.play('bounce');
-      }
-      if (!out[14]) movementSounds.update({ x: out[6], z: out[8], grounded: Boolean(out[15]), moving: Boolean(mx || mz), events: ev }, dt);
-    }
-
     const nb = w.box_count(), nn = w.node_count(), np = w.prim_count();
     device.queue.writeBuffer(boxBuf, 0, mem, w.boxes_ptr(), nb * 64);
     device.queue.writeBuffer(nodeBuf, 0, mem, w.nodes_ptr(), nn * 32);
@@ -604,7 +621,7 @@ async function main() {
     device.queue.writeBuffer(lightBuf, 0, mem, w.lights_ptr(), Math.min(nl, MAX_LIGHTS) * 32);
 
     const view = m4.lookAt(eye, target, [0, 1, 0]);
-    const proj = m4.persp(70 * Math.PI / 180, W / H, 0.1);
+    const proj = m4.persp(fovY, W / H, 0.1);
     const vp = m4.mul(proj, view);
     const invVP = m4.inv(vp);
     uni.set(vp, 0);
@@ -622,7 +639,7 @@ async function main() {
 
     // ---- cascaded shadow maps: fit a sphere around each frustum slice, snap to texels
     const fwd = norm3(sub3(target, eye));
-    const tanY = Math.tan(35 * Math.PI / 180), tanX = tanY * W / H;
+    const tanY = Math.tan(fovY / 2), tanX = tanY * W / H;
     const right = norm3(cross3(fwd, [0, 1, 0])), up = cross3(right, fwd);
     const splits = [0.1, dist + 10, (dist + 10) * 2.8, 190];
     const texel = [0, 0, 0, 0], range = [0, 0, 0, 0];
@@ -656,7 +673,6 @@ async function main() {
     uni.set([rtOn ? 0 : 1, 1, 1, RASTER_EXPOSURE], 168);
     device.queue.writeBuffer(uniBuf, 0, uni);
     prevVP = vp; prevInvVP = invVP; prevEye = eye;
-    flash = Math.max(0, flash - dt * 2.5);
 
     const par = frameNo & 1;
     const bg = BG[par];
@@ -730,23 +746,149 @@ async function main() {
     for (const b of bloomPasses) run(b.pipe, b.group, Math.ceil(b.dims[0] / 8), Math.ceil(b.dims[1] / 8));
 
     const pp = enc.beginRenderPass({
-      colorAttachments: [{ view: ctx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }],
+      colorAttachments: [{ view: outView, loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }],
     });
     pp.setPipeline(postPipe);
     pp.setBindGroup(0, bg.post);
     pp.draw(3);
     pp.end();
+    if (beforeSubmit) beforeSubmit(enc, par);
     device.queue.submit([enc.finish()]);
-    inFlight++;
-    const t0 = performance.now();
-    device.queue.onSubmittedWorkDone().then(() => { inFlight--; gpuMs = gpuMs * 0.9 + (performance.now() - t0) * 0.1; });
     frameNo++;
+    return { nb, nl, vp, invVP, par };
+
+  }
+
+  // ---- asynchronous reprojection driver
+  const FOV = 70 * Math.PI / 180;
+  const FOV_OVERSCAN = 2 * Math.atan(Math.tan(FOV / 2) * OVERSCAN);
+  const SCENE_CAPS = [0, 30, 15, 8];   // 0 = as fast as the GPU allows
+  let asyncOn = false, capIdx = 0, sceneBusy = false, lastSceneT = -1e9, warpSrc = null, warpInFlight = 0;
+  let sceneCount = 0, sceneT0 = performance.now(), sceneFps = 0, lastNb = 0, lastNl = 0;
+  const wu = new Float32Array(36);
+
+  function startAsyncScene(now, eye, target) {
+    const p = frameNo & 1;
+    const wp = warp;
+    const r = renderScene(now, eye, target, (p ? tex.ldr1 : tex.ldr0).createView(), FOV_OVERSCAN, (enc, par) => {
+      if (!twoDev) return;
+      enc.copyTextureToBuffer({ texture: par ? tex.ldr1 : tex.ldr0 }, { buffer: wp.stC, bytesPerRow: wp.cbpr }, [CW, CH]);
+      enc.copyTextureToBuffer({ texture: par ? tex.depth1 : tex.depth0, aspect: 'depth-only' }, { buffer: wp.stD, bytesPerRow: wp.dbpr }, [W, H]);
+    });
+    sceneBusy = true;
+    // one device: the queue already orders the warp after this frame, so present it right away
+    if (!twoDev) warpSrc = { invVP: r.invVP, par: r.par, W, H };
+    const t0 = performance.now();
+    const done = () => {
+      warpSrc = { invVP: r.invVP, par: r.par, W, H };
+      sceneBusy = false;
+      sceneCount++;
+      gpuMs = gpuMs * 0.8 + (performance.now() - t0) * 0.2;
+    };
+    device.queue.onSubmittedWorkDone().then(async () => {
+      if (!twoDev) { done(); return; }
+      // hand the finished frame to the present device (staging read-back, then upload)
+      await Promise.all([wp.stC.mapAsync(GPUMapMode.READ), wp.stD.mapAsync(GPUMapMode.READ)]);
+      if (wp === warp) {
+        pdev.queue.writeTexture({ texture: wp.sc }, wp.stC.getMappedRange(), { bytesPerRow: wp.cbpr }, [CW, CH]);
+        pdev.queue.writeTexture({ texture: wp.sd }, wp.stD.getMappedRange(), { bytesPerRow: wp.dbpr }, [W, H]);
+      }
+      wp.stC.unmap(); wp.stD.unmap();
+      if (wp === warp) done(); else sceneBusy = false;
+    }).catch(() => { sceneBusy = false; });
+    return r;
+  }
+
+  function presentWarp(eye, target) {
+    if (!warpSrc || warpInFlight >= 2) return;
+    const view = m4.lookAt(eye, target, [0, 1, 0]);
+    const vp = m4.mul(m4.persp(FOV, W / H, 0.1), view);
+    wu.set(vp, 0);
+    wu.set(warpSrc.invVP, 16);
+    wu.set([warpSrc.W, warpSrc.H, CW, CH], 32);
+    pdev.queue.writeBuffer(warpUni, 0, wu);
+    const enc = pdev.createCommandEncoder();
+    const rp = enc.beginRenderPass({
+      colorAttachments: [{ view: ctx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }],
+    });
+    rp.setPipeline(warpPipe);
+    rp.setBindGroup(0, warp.bg[warpSrc.par]);
+    rp.draw(3);
+    rp.end();
+    pdev.queue.submit([enc.finish()]);
+    warpInFlight++;
+    pdev.queue.onSubmittedWorkDone().then(() => { warpInFlight--; });
+  }
+  function setAsync(on) {
+    asyncOn = on;
+    warpSrc = null;
+    if (twoDev) ctx.configure({ device: on ? pdev : device, format, alphaMode: 'opaque' });
+  }
+
+  // At most 2 frames queued on the GPU; otherwise a slow path-traced frame lets the queue grow
+  // without bound and the page freezes behind it.
+  let inFlight = 0, gpuMs = 0;
+  function tick(now) {
+    if (!asyncOn && inFlight >= 2) { requestAnimationFrame(tick); return; }
+    const dt = Math.min((now - last) / 1000, 0.1); last = now;
+    fpsAcc += dt; fpsN++;
+    if (fpsAcc > 0.5) { fps = fpsN / fpsAcc; fpsAcc = 0; fpsN = 0; }
+    resize();
+
+    const k = (c) => (keys.has(c) ? 1 : 0);
+    const mz = playing ? k('KeyW') + k('ArrowUp') - k('KeyS') - k('ArrowDown') : 0;
+    const mx = playing ? k('KeyD') + k('ArrowRight') - k('KeyA') - k('ArrowLeft') : 0;
+    const jump = playing ? k('Space') : 0;
+    if (!playing) yaw += dt * 0.08; // idle orbit behind the title card
+    w.frame(dt, mx, mz, jump, yaw, pitch, dist);
+
+    const mem = w.memory.buffer;
+    const out = new Float32Array(mem, w.out_ptr(), 32);
+    const eye = [out[0], out[1], out[2]], target = [out[3], out[4], out[5]];
+    const ev = out[13];
+    if (ev & 1) flashMsg(`Checkpoint! Stage ${out[9]}`);
+    if (ev & 2) flash = 1;
+    if (ev & 4) { $('win').style.display = 'flex'; $('wintime').textContent = fmtTime(out[12]); $('windeaths').textContent = out[11]; }
+    if (playing) {
+      // Death/win take priority over incidental sounds from the same physics frame.
+      if (ev & 2) sounds.play('death');
+      else if (ev & 4) sounds.play('win');
+      else {
+        if (ev & 1) sounds.play('checkpoint');
+        if (ev & 8) sounds.play('jump');
+        if (ev & 16) sounds.play('bounce');
+      }
+      if (!out[14]) movementSounds.update({ x: out[6], z: out[8], grounded: Boolean(out[15]), moving: Boolean(mx || mz), events: ev }, dt);
+    }
+
+    let nb = lastNb, nl = lastNl;
+    if (!asyncOn) {
+      const r = renderScene(now, eye, target, ctx.getCurrentTexture().createView(), FOV, null);
+      nb = r.nb; nl = r.nl;
+      inFlight++;
+      const t0 = performance.now();
+      device.queue.onSubmittedWorkDone().then(() => { inFlight--; gpuMs = gpuMs * 0.9 + (performance.now() - t0) * 0.1; });
+    } else {
+      const cap = SCENE_CAPS[capIdx];
+      if (!sceneBusy && (cap === 0 || now - lastSceneT >= 1000 / cap - 2)) {
+        lastSceneT = now;
+        const r = startAsyncScene(now, eye, target);
+        nb = r.nb; nl = r.nl;
+      }
+      presentWarp(eye, target);
+    }
+    lastNb = nb; lastNl = nl;
+    flash = Math.max(0, flash - dt * 2.5);
 
     // HUD
     $('stage').textContent = `${out[9]} / ${out[10]}`;
     $('deaths').textContent = out[11];
     $('time').textContent = fmtTime(out[12]);
-    $('perf').textContent = `${fps.toFixed(0)} fps · ${gpuMs.toFixed(1)} ms · ${W}×${H} · ${nb} boxes · ${rtOn ? (ptOn ? 'ReSTIR PT Enhanced' : 'hybrid RT') : `raster GI · ${nl} lights`}`;
+    if (now - sceneT0 > 500) { sceneFps = sceneCount * 1000 / (now - sceneT0); sceneCount = 0; sceneT0 = now; }
+    const mode = rtOn ? (ptOn ? 'ReSTIR PT Enhanced' : 'hybrid RT') : `raster GI · ${nl} lights`;
+    $('perf').textContent = asyncOn
+      ? `timewarp ${fps.toFixed(0)} fps · scene ${sceneFps.toFixed(0)} fps${SCENE_CAPS[capIdx] ? ` (cap ${SCENE_CAPS[capIdx]})` : ''} · ${W}×${H} · ${mode}`
+      : `${fps.toFixed(0)} fps · ${gpuMs.toFixed(1)} ms · ${W}×${H} · ${nb} boxes · ${mode}`;
     if (msgTimer > 0) { msgTimer -= dt; if (msgTimer <= 0) $('msg').style.opacity = 0; }
     requestAnimationFrame(tick);
   }
