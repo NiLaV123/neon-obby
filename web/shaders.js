@@ -1300,144 +1300,6 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 }
 `;
 
-export const SHADE_WGSL = RT_COMMON + /* wgsl */ `
-@group(0) @binding(6) var albedoTex: texture_2d<f32>;
-@group(0) @binding(7) var rawIn: texture_2d<f32>;
-@group(0) @binding(8) var histIn: texture_2d<f32>;
-@group(0) @binding(9) var histOut: texture_storage_2d<rgba16float, write>;
-@group(0) @binding(10) var hdrOut: texture_storage_2d<rgba16float, write>;
-@group(0) @binding(11) var ptTex: texture_2d<f32>;   // denoised PT illumination (albedo divided out)
-
-@compute @workgroup_size(8, 8)
-fn main(@builtin(global_invocation_id) gid: vec3u) {
-  let dims = vec2u(u.res.xy);
-  if (gid.x >= dims.x || gid.y >= dims.y) { return; }
-  let px = vec2i(gid.xy);
-  let rt = u.res.z > 0.5;
-  let cam = u.camPos.xyz;
-
-  let d = textureLoad(depthTex, px, 0);
-  if (d <= 0.0) {
-    let np = u.invViewProj * vec4f(ndcOf(px), 1.0, 1.0);
-    let rd = normalize(np.xyz / np.w - cam);
-    textureStore(hdrOut, px, vec4f(sky(rd), 1.0));
-    textureStore(histOut, px, vec4f(1.0, 1.0, 0.0, 0.0));
-    return;
-  }
-
-  let wp = worldPos(px, d);
-  let nt = textureLoad(normalTex, px, 0);
-  let n = normalize(nt.xyz);
-  let id = u32(nt.w + 0.5);
-  var s = Surf(wp, n, textureLoad(albedoTex, px, 0).rgb, id);
-  var rd = normalize(wp - cam);
-  let dist = length(wp - cam);
-  let viewZ = (u.viewProj * vec4f(wp, 1.0)).w;
-
-  if (rt && u.opts.x > 0.5) {
-    // ReSTIR PT Enhanced: primary emission + the denoised illumination re-modulated by albedo
-    textureStore(histOut, px, vec4f(1.0, 1.0, viewZ, 1.0));
-    let illum = textureLoad(ptTex, px, 0).rgb;
-    var col = s.alb * boxes[id].emis + max(s.alb, vec3f(0.03)) * illum;
-    let fogPT = 1.0 - exp(-max(dist - 60.0, 0.0) * 0.0035);
-    col = mix(col, sky(rd) * 0.95, fogPT);
-    textureStore(hdrOut, px, vec4f(col, 1.0));
-    return;
-  }
-
-  var shadow = select(0.0, 1.0, dot(n, u.sunDir.xyz) > 0.0);
-  var ao = 1.0;
-  if (rt) {
-    let raw = textureLoad(rawIn, px, 0).xy;
-    // 3x3 neighbourhood statistics over pixels on the same surface orientation
-    var m1 = vec2f(0.0);
-    var m2 = vec2f(0.0);
-    var wsum = 0.0;
-    let maxp = vec2i(dims) - 1;
-    for (var dy = -1; dy <= 1; dy++) {
-      for (var dx = -1; dx <= 1; dx++) {
-        let q = clamp(px + vec2i(dx, dy), vec2i(0), maxp);
-        let nq = textureLoad(normalTex, q, 0).xyz;
-        if (dot(nq, n) < 0.8) { continue; }
-        let r = textureLoad(rawIn, q, 0).xy;
-        m1 += r;
-        m2 += r * r;
-        wsum += 1.0;
-      }
-    }
-    let mean = m1 / wsum;
-    let sigma = sqrt(max(m2 / wsum - mean * mean, vec2f(0.0)));
-
-    var v = raw;
-    var cnt = 1.0;
-    let pc = u.prevViewProj * vec4f(wp, 1.0);
-    if (pc.w > 0.0) {
-      let puv = vec2f(pc.x / pc.w * 0.5 + 0.5, 0.5 - pc.y / pc.w * 0.5);
-      if (all(puv >= vec2f(0.0)) && all(puv < vec2f(1.0))) {
-        let h = textureLoad(histIn, vec2i(puv * u.res.xy), 0);
-        if (h.z > 0.0 && abs(h.z - pc.w) < 0.02 * pc.w + 0.05) {
-          let hc = clamp(h.xy, mean - 1.25 * sigma, mean + 1.25 * sigma);
-          // big correction = the lighting changed here (occluder moved): restart accumulation
-          cnt = select(min(h.w + 1.0, 12.0), 2.0, max(abs(hc.x - h.x), abs(hc.y - h.y)) > 0.2);
-          v = mix(hc, raw, 1.0 / cnt);
-        }
-      }
-    }
-    textureStore(histOut, px, vec4f(v, viewZ, cnt));
-    // freshly (re)started pixels lean on the spatial mean to hide 1-sample noise
-    let disp = mix(mean, v, clamp((cnt - 1.0) / 4.0, 0.0, 1.0));
-    shadow = disp.x;
-    ao = disp.y;
-  } else {
-    textureStore(histOut, px, vec4f(1.0, 1.0, 0.0, 0.0));
-  }
-
-  var amb = ambient(n) * ao;
-
-  // shading + specular chain (mirrors, polished floors, glass)
-  var col = vec3f(0.0);
-  var thr = vec3f(1.0);
-  var ao_s = ao;
-  for (var bounce = 0; bounce < 4; bounce++) {
-    let b = boxes[s.id];
-    let m = matOf(b);
-    let cosT = max(dot(-rd, s.n), 0.0);
-    var kr = 0.0;   // traced reflection weight
-    var kt = 0.0;   // traced transmission weight
-    var ke = 0.0;   // cheap sky-only reflection weight
-    var tint = vec3f(1.0);
-    if (m == M_METAL) { kr = b.refl; tint = s.alb; }
-    else if (m == M_POLISHED) { kr = fresnel(cosT, b.refl); }
-    else if (m == M_GLASS) { let f = fresnel(cosT, 0.04); kt = (1.0 - f) * 0.9; ke = f; tint = s.alb; }
-    else if (m == M_GHOST) { kt = 0.82; tint = mix(s.alb, vec3f(1.0), 0.6); }
-    else if (m != M_NEON) { ke = fresnel(cosT, 0.03) * 0.5; }
-
-    let refl = reflect(rd, s.n);
-    if (!rt) { ke += kr; kr = 0.0; kt = 0.0; }
-    let diffuseW = max(1.0 - kr - kt - ke, 0.0);
-    col += thr * (shade(s, shadow, amb) * diffuseW + sky(refl) * ke * (0.35 + 0.65 * ao_s) * shadow * 0.8 + sky(refl) * ke * 0.2);
-    if (kr + kt < 0.01 || bounce == 3) { break; }
-
-    var nd = refl;
-    var org = s.p + s.n * 0.02;
-    var k = kr;
-    if (kt > 0.0) { nd = rd; org = s.p + rd * 0.01; k = kt; }
-    thr *= k * tint;
-    let h = trace(org, nd, 1e4, s.id, false);
-    if (h.id == NONE) { col += thr * sky(nd); break; }
-    s = surfAt(h.id, org + nd * h.t);
-    rd = nd;
-    shadow = hardShadow(s.p, s.n);
-    ao_s = 0.85;
-    amb = ambient(s.n) * ao_s;
-  }
-
-  let fog = 1.0 - exp(-max(dist - 60.0, 0.0) * 0.0035);
-  col = mix(col, sky(normalize(wp - cam)) * 0.95, fog);
-  textureStore(hdrOut, px, vec4f(col, 1.0));
-}
-`;
-
 export const POST_WGSL = COMMON + /* wgsl */ `
 @group(0) @binding(0) var hdr: texture_2d<f32>;
 @group(0) @binding(1) var<uniform> u: U;
@@ -2030,33 +1892,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 }
 `;
 
-export const LIGHT_WGSL = COMMON + SKY_FN + BRDF_FN + /* wgsl */ `
-@group(0) @binding(0) var<uniform> u: U;
-@group(0) @binding(1) var<storage, read> boxes: array<Box>;
-@group(0) @binding(2) var normalTex: texture_2d<f32>;
-@group(0) @binding(3) var depthTex: texture_depth_2d;
-@group(0) @binding(4) var albedoTex: texture_2d<f32>;
-@group(0) @binding(5) var shadowMap: texture_depth_2d_array;
-@group(0) @binding(6) var shadowSamp: sampler_comparison;
-@group(0) @binding(7) var<storage, read> probeIrr: array<vec4f>;
-@group(0) @binding(8) var<storage, read> probeDepth: array<vec2f>;
-@group(0) @binding(9) var<storage, read> probeState: array<vec4i>;
-@group(0) @binding(10) var<storage, read> lights: array<Light>;
-@group(0) @binding(11) var aoTex: texture_2d<f32>;
-@group(0) @binding(12) var hdrPrev: texture_2d<f32>;
-@group(0) @binding(13) var linSamp: sampler;
-@group(0) @binding(14) var hdrOut: texture_storage_2d<rgba16float, write>;
-` + PROBE_FN + LIGHTS_FN + SHADOW_FN + FOG_FN + /* wgsl */ `
-fn ndcOf(px: vec2f) -> vec2f {
-  let uv = (px + 0.5) / u.res.xy;
-  return vec2f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-}
-fn worldPos(px: vec2f, d: f32) -> vec3f {
-  let wh = u.invViewProj * vec4f(ndcOf(px), d, 1.0);
-  return wh.xyz / wh.w;
-}
-fn ign(p: vec2f) -> f32 { return fract(52.9829189 * fract(dot(p, vec2f(0.06711056, 0.00583715)))); }
-
+const LAVA_FN = /* wgsl */ `
 fn hash2(p: vec2f) -> f32 { return fract(sin(dot(p, vec2f(127.1, 311.7))) * 43758.5453); }
 fn vnoise(p: vec2f) -> f32 {
   let i = floor(p);
@@ -2081,6 +1917,35 @@ fn lavaSurface(p: vec2f, t: f32) -> Lava {
   let hot = mix(vec3f(1.0, 0.07, 0.0), vec3f(1.0, 0.42, 0.04), heat * heat) * (0.12 + 4.0 * heat * heat);
   return Lava(mix(vec3f(0.035, 0.022, 0.02), vec3f(0.2, 0.05, 0.02), heat), hot);
 }
+
+`;
+
+export const LIGHT_WGSL = COMMON + SKY_FN + BRDF_FN + /* wgsl */ `
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var<storage, read> boxes: array<Box>;
+@group(0) @binding(2) var normalTex: texture_2d<f32>;
+@group(0) @binding(3) var depthTex: texture_depth_2d;
+@group(0) @binding(4) var albedoTex: texture_2d<f32>;
+@group(0) @binding(5) var shadowMap: texture_depth_2d_array;
+@group(0) @binding(6) var shadowSamp: sampler_comparison;
+@group(0) @binding(7) var<storage, read> probeIrr: array<vec4f>;
+@group(0) @binding(8) var<storage, read> probeDepth: array<vec2f>;
+@group(0) @binding(9) var<storage, read> probeState: array<vec4i>;
+@group(0) @binding(10) var<storage, read> lights: array<Light>;
+@group(0) @binding(11) var aoTex: texture_2d<f32>;
+@group(0) @binding(12) var hdrPrev: texture_2d<f32>;
+@group(0) @binding(13) var linSamp: sampler;
+@group(0) @binding(14) var hdrOut: texture_storage_2d<rgba16float, write>;
+` + PROBE_FN + LIGHTS_FN + SHADOW_FN + FOG_FN + LAVA_FN + /* wgsl */ `
+fn ndcOf(px: vec2f) -> vec2f {
+  let uv = (px + 0.5) / u.res.xy;
+  return vec2f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+}
+fn worldPos(px: vec2f, d: f32) -> vec3f {
+  let wh = u.invViewProj * vec4f(ndcOf(px), d, 1.0);
+  return wh.xyz / wh.w;
+}
+fn ign(p: vec2f) -> f32 { return fract(52.9829189 * fract(dot(p, vec2f(0.06711056, 0.00583715)))); }
 
 // Screen-space reflection: march the reflected ray in clip space against the depth buffer,
 // refine with a binary search, then fetch last frame's final colour at the reprojected hit.
@@ -2370,3 +2235,214 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   textureStore(dst, gid.xy, vec4f(c + t / 16.0, 1.0));
 }
 `;
+
+export const SHADE_WGSL = RT_COMMON + BRDF_FN + /* wgsl */ `
+@group(0) @binding(6) var albedoTex: texture_2d<f32>;
+@group(0) @binding(7) var rawIn: texture_2d<f32>;
+@group(0) @binding(8) var histIn: texture_2d<f32>;
+@group(0) @binding(9) var histOut: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(10) var hdrOut: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(11) var ptTex: texture_2d<f32>;   // denoised PT illumination (albedo divided out)
+@group(0) @binding(12) var<storage, read> probeIrr: array<vec4f>;
+@group(0) @binding(13) var<storage, read> probeDepth: array<vec2f>;
+@group(0) @binding(14) var<storage, read> probeState: array<vec4i>;
+@group(0) @binding(15) var<storage, read> lights: array<Light>;
+` + PROBE_FN + LIGHTS_FN + FOG_FN + LAVA_FN + /* wgsl */ `
+
+var<workgroup> tMin: array<vec3f, 64>;
+var<workgroup> tMax: array<vec3f, 64>;
+var<workgroup> tileLights: array<u32, 64>;
+var<workgroup> tileCount: atomic<u32>;
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_index) li: u32) {
+  let dims = vec2u(u.res.xy);
+  let cam = u.camPos.xyz;
+  // tiled light culling for the primary hits (same scheme as the raster LIGHT pass)
+  {
+    let inside = gid.x < dims.x && gid.y < dims.y;
+    let tp = vec2i(min(gid.xy, dims - 1u));
+    let td = textureLoad(depthTex, tp, 0);
+    let twp = worldPos(tp, max(td, 1e-6));
+    let geo = inside && td > 0.0;
+    tMin[li] = select(vec3f(1e9), twp, geo);
+    tMax[li] = select(vec3f(-1e9), twp, geo);
+    if (li == 0u) { atomicStore(&tileCount, 0u); }
+    workgroupBarrier();
+    for (var st = 32u; st > 0u; st >>= 1u) {
+      if (li < st) {
+        tMin[li] = min(tMin[li], tMin[li + st]);
+        tMax[li] = max(tMax[li], tMax[li + st]);
+      }
+      workgroupBarrier();
+    }
+    let bmin = tMin[0];
+    let bmax = tMax[0];
+    let cnt = u32(u.probeInfo.z);
+    for (var i = li; i < cnt; i += 64u) {
+      let L = lights[i];
+      let q = clamp(L.p, bmin, bmax);
+      if (dot(q - L.p, q - L.p) < L.radius * L.radius) {
+        let k = atomicAdd(&tileCount, 1u);
+        if (k < 64u) { tileLights[k] = i; }
+      }
+    }
+    workgroupBarrier();
+  }
+  let nTile = min(atomicLoad(&tileCount), 64u);
+  if (gid.x >= dims.x || gid.y >= dims.y) { return; }
+  let px = vec2i(gid.xy);
+  let rt = u.res.z > 0.5;
+
+  let d = textureLoad(depthTex, px, 0);
+  if (d <= 0.0) {
+    let np = u.invViewProj * vec4f(ndcOf(px), 1.0, 1.0);
+    let rd = normalize(np.xyz / np.w - cam);
+    let expo = select(u.rasterInfo.w, 1.0, rt && u.opts.x > 0.5);
+    textureStore(hdrOut, px, vec4f(sky(rd) * expo, 1.0));
+    textureStore(histOut, px, vec4f(1.0, 1.0, 0.0, 0.0));
+    return;
+  }
+
+  let wp = worldPos(px, d);
+  let nt = textureLoad(normalTex, px, 0);
+  let n = normalize(nt.xyz);
+  let id = u32(nt.w + 0.5);
+  var s = Surf(wp, n, textureLoad(albedoTex, px, 0).rgb, id);
+  var rd = normalize(wp - cam);
+  let dist = length(wp - cam);
+  let viewZ = (u.viewProj * vec4f(wp, 1.0)).w;
+
+  if (rt && u.opts.x > 0.5) {
+    // ReSTIR PT Enhanced: primary emission + the denoised illumination re-modulated by albedo
+    textureStore(histOut, px, vec4f(1.0, 1.0, viewZ, 1.0));
+    let illum = textureLoad(ptTex, px, 0).rgb;
+    var col = s.alb * boxes[id].emis + max(s.alb, vec3f(0.03)) * illum;
+    let fogPT = 1.0 - exp(-max(dist - 60.0, 0.0) * 0.0035);
+    col = mix(col, sky(rd) * 0.95, fogPT);
+    textureStore(hdrOut, px, vec4f(col, 1.0));
+    return;
+  }
+
+  var shadow = select(0.0, 1.0, dot(n, u.sunDir.xyz) > 0.0);
+  var ao = 1.0;
+  if (rt) {
+    let raw = textureLoad(rawIn, px, 0).xy;
+    // 3x3 neighbourhood statistics over pixels on the same surface orientation
+    var m1 = vec2f(0.0);
+    var m2 = vec2f(0.0);
+    var wsum = 0.0;
+    let maxp = vec2i(dims) - 1;
+    for (var dy = -1; dy <= 1; dy++) {
+      for (var dx = -1; dx <= 1; dx++) {
+        let q = clamp(px + vec2i(dx, dy), vec2i(0), maxp);
+        let nq = textureLoad(normalTex, q, 0).xyz;
+        if (dot(nq, n) < 0.8) { continue; }
+        let r = textureLoad(rawIn, q, 0).xy;
+        m1 += r;
+        m2 += r * r;
+        wsum += 1.0;
+      }
+    }
+    let mean = m1 / wsum;
+    let sigma = sqrt(max(m2 / wsum - mean * mean, vec2f(0.0)));
+
+    var v = raw;
+    var cnt = 1.0;
+    let pc = u.prevViewProj * vec4f(wp, 1.0);
+    if (pc.w > 0.0) {
+      let puv = vec2f(pc.x / pc.w * 0.5 + 0.5, 0.5 - pc.y / pc.w * 0.5);
+      if (all(puv >= vec2f(0.0)) && all(puv < vec2f(1.0))) {
+        let h = textureLoad(histIn, vec2i(puv * u.res.xy), 0);
+        if (h.z > 0.0 && abs(h.z - pc.w) < 0.02 * pc.w + 0.05) {
+          let hc = clamp(h.xy, mean - 1.25 * sigma, mean + 1.25 * sigma);
+          // big correction = the lighting changed here (occluder moved): restart accumulation
+          cnt = select(min(h.w + 1.0, 12.0), 2.0, max(abs(hc.x - h.x), abs(hc.y - h.y)) > 0.2);
+          v = mix(hc, raw, 1.0 / cnt);
+        }
+      }
+    }
+    textureStore(histOut, px, vec4f(v, viewZ, cnt));
+    // freshly (re)started pixels lean on the spatial mean to hide 1-sample noise
+    let disp = mix(mean, v, clamp((cnt - 1.0) / 4.0, 0.0, 1.0));
+    shadow = disp.x;
+    ao = disp.y;
+  } else {
+    textureStore(histOut, px, vec4f(1.0, 1.0, 0.0, 0.0));
+  }
+
+  // Hybrid RT: ray-traced soft sun shadow + AO (denoised above), DDGI probes for the bounce
+  // light, the hand-placed lights, GGX materials, and a traced specular chain for mirrors,
+  // polished floors and glass (instead of screen-space reflections).
+  var col = vec3f(0.0);
+  var thr = vec3f(1.0);
+  var aoS = ao;
+  for (var bounce = 0; bounce < 4; bounce++) {
+    let b = boxes[s.id];
+    let m = matOf(b);
+    let mt = matParams(m);
+    let v = -rd;
+    let nv = max(dot(s.n, v), 1e-4);
+    let isLava = m == M_NEON && b.h.x > 300.0;
+    var lv = Lava(vec3f(0.0), vec3f(0.0));
+    if (isLava) { lv = lavaSurface(s.p.xz, u.camPos.w); s.alb = lv.alb; }
+    var kr = 0.0;   // traced reflection weight
+    var kt = 0.0;   // traced transmission weight
+    var ke = 0.0;   // Fresnel reflection of glass (probe / sky env)
+    var tint = vec3f(1.0);
+    if (m == M_METAL) { kr = b.refl; tint = s.alb; }
+    else if (m == M_POLISHED) { kr = fresnel(nv, b.refl); }
+    else if (m == M_GLASS) { let f = fresnel(nv, 0.04); kt = (1.0 - f) * 0.9; ke = f; tint = s.alb; }
+    else if (m == M_GHOST) { kt = 0.82; tint = mix(s.alb, vec3f(1.0), 0.6); }
+
+    let refl = reflect(rd, s.n);
+    let L = u.sunDir.xyz;
+    var lit = vec3f(0.0);
+    let ndl = dot(s.n, L);
+    if (ndl > 0.0) { lit += brdf(s.n, v, L, s.alb, mt) * SUN_COL * ndl * shadow; }
+    if (bounce == 0) {
+      for (var k = 0u; k < nTile; k++) { lit += shadeLight(lights[tileLights[k]], s.p, s.n, v, s.alb, mt); }
+    } else {
+      lit += localLights(s.p, s.n, v, s.alb, mt);
+    }
+    let ph = probeLookup2(s.p, s.n, v, refl, kr == 0.0 || ke > 0.0);
+    let f0 = mix(vec3f(0.04), s.alb, mt.metal);
+    let Fe = envBRDF(f0, nv, mt.rough);
+    let ca = 2.0404 * s.alb - 0.3324;
+    let cb = -4.7951 * s.alb + 0.6417;
+    let cc = 2.7552 * s.alb + 0.6903;
+    let aoMB = max(vec3f(aoS), ((aoS * ca + cb) * aoS + cc) * aoS);
+    lit += s.alb * ph.irr * aoMB * (1.0 - mt.metal) * (1.0 - Fe);
+    let skyVis = skyVisibility(s.p + s.n * 0.3, refl);
+    var env = skyDiffuse(refl);
+    if (ph.w > 1e-5) { env = mix(ph.refl, env, skyVis); }
+    if (mt.rough < 0.12 && skyVis > 0.5) { env = mix(env, sky(refl), (skyVis - 0.5) * 2.0); }
+    if (kr == 0.0) {   // rough surfaces: prefiltered probe / sky reflection instead of a traced ray
+      let specOcc = clamp(pow(nv + aoS, exp2(-16.0 * mt.rough - 1.0)) - 1.0 + aoS, 0.0, 1.0);
+      lit += env * Fe * specOcc;
+    }
+    if (isLava) { lit += lv.emis; }
+    else if (m == M_NEON) { lit = lit * 0.2 + s.alb * b.emis * 0.95; }
+    else { lit += s.alb * b.emis; }
+
+    col += thr * (lit * max(1.0 - kr - kt - ke, 0.0) + env * ke);
+    if (kr + kt < 0.01 || bounce == 3) { break; }
+
+    var nd = refl;
+    var org = s.p + s.n * 0.02;
+    var k = kr;
+    if (kt > 0.0) { nd = rd; org = s.p + rd * 0.01; k = kt; }
+    thr *= k * tint;
+    let h = trace(org, nd, 1e4, s.id, false);
+    if (h.id == NONE) { col += thr * sky(nd); break; }
+    s = surfAt(h.id, org + nd * h.t);
+    rd = nd;
+    shadow = hardShadow(s.p, s.n);
+    aoS = 1.0;
+  }
+
+  col = heightFog(col, wp, cam);
+  textureStore(hdrOut, px, vec4f(col * u.rasterInfo.w, 1.0));
+}
+`;
+

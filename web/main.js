@@ -402,6 +402,8 @@ async function main() {
             { binding: 9, resource: i ? v.hist0 : v.hist1 },
             { binding: 10, resource: v.hdr },
             { binding: 11, resource: v.dnB }, // denoised PT illumination (after 5 a-trous passes)
+            { binding: 12, resource: buf(probeIrrBuf) }, { binding: 13, resource: buf(probeDepBuf) },
+            { binding: 14, resource: buf(probeStateBuf) }, { binding: 15, resource: buf(lightBuf) },
           ],
         }),
         ptT: device.createBindGroup({
@@ -494,7 +496,7 @@ async function main() {
     if (e.code === 'Space') e.preventDefault();
     if (e.repeat) return;
     if (e.code === 'KeyR') { rtOn = !rtOn; clearPT = true; flashMsg(rtOn ? (ptOn ? 'ReSTIR PT Enhanced' : 'Hybrid ray tracing') : 'Raster lighting: probes + lights + shadow maps'); }
-    if (e.code === 'KeyP') { ptOn = !ptOn; clearPT = true; flashMsg(ptOn ? 'ReSTIR PT Enhanced ON' : 'Hybrid RT (direct shadows + mirrors, flat ambient)'); }
+    if (e.code === 'KeyP') { ptOn = !ptOn; clearPT = true; flashMsg(ptOn ? 'ReSTIR PT Enhanced ON' : 'Hybrid RT: traced shadows + reflections, probe GI, lights'); }
     if (e.code === 'KeyG') { scaleIdx = (scaleIdx + 1) % SCALES.length; renderScale = SCALES[scaleIdx]; flashMsg(`Render scale ${Math.round(renderScale * 100)}%`); }
     if (e.code === 'KeyK') w.respawn();
     if (e.code === 'KeyT') { w.restart(); $('win').style.display = 'none'; }
@@ -670,11 +672,14 @@ async function main() {
     } else if (rtOn) {
       run(tracePipe, bg.trace);
     }
+    if (!(rtOn && ptOn)) {
+      // DDGI probes light both the raster and the hybrid RT modes
+      run(probeTPipe, probeTraceBG, Math.ceil(PROBES / 2 * PRAYS / 64), 1); // trace probe rays
+      run(probeUPipe, probeUpdateBG, PROBES / 2, 1);                        // blend into probes
+    }
     if (rtOn) {
       run(shadePipe, bg.shade);
     } else {
-      run(probeTPipe, probeTraceBG, Math.ceil(PROBES / 2 * PRAYS / 64), 1); // DDGI: trace probe rays
-      run(probeUPipe, probeUpdateBG, PROBES / 2, 1);                        // DDGI: blend into probes
       run(aoPipe, bg.ao, Math.ceil(W / 16), Math.ceil(H / 16)); // half-res AO
       run(aoBPipe, bg.aoB);
       run(lightPipe, bg.light);                                         // deferred lighting
