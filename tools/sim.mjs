@@ -1,10 +1,15 @@
 import fs from 'fs';
+import assert from 'node:assert/strict';
 const { instance } = await WebAssembly.instantiate(fs.readFileSync(process.argv[2]), {});
 const w = instance.exports;
 w.init();
 const out = () => new Float32Array(w.memory.buffer, w.out_ptr(), 32);
 const step = (n, mx, mz, jump) => { for (let i = 0; i < n; i++) w.frame(1/60, mx, mz, jump, Math.PI, 0.3, 18); return out(); };
 let o = step(60, 0, 0, 0);
+assert.equal(o[12], 0, 'title-screen frames must not advance the run timer');
+w.start();
+o = step(60, 0, 0, 0);
+assert.ok(Math.abs(o[12] - 1) < 0.001, 'the timer must advance after starting');
 console.log('idle pos', [...o.slice(6, 9)].map(v=>v.toFixed(2)), 'grounded', o[15], 'eye', [...o.slice(0,3)].map(v=>v.toFixed(1)));
 console.log('boxes', w.box_count(), 'nodes', w.node_count(), 'prims', w.prim_count(), 'stages', o[10]);
 o = step(30, 0, 1, 0); console.log('walk fwd 0.5s z', o[8].toFixed(2), 'facing', o[16].toFixed(2));

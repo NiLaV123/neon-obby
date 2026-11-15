@@ -368,6 +368,7 @@ async function main() {
   });
   canvas.addEventListener('wheel', (e) => { e.preventDefault(); dist = Math.min(45, Math.max(4, dist * Math.exp(e.deltaY * 0.001))); }, { passive: false });
   $('start').addEventListener('click', () => {
+    w.start();
     playing = true;
     $('start').style.display = 'none';
     try { audio = audio || new AudioContext(); } catch { /* no audio */ }

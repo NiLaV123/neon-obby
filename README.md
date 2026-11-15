@@ -29,3 +29,11 @@ rustup target add wasm32-unknown-unknown
 python3 -m http.server -d web 8080
 ```
 Pushing to `main` builds and deploys to GitHub Pages via `.github/workflows/pages.yml`.
+
+## Checks
+```sh
+cargo test --locked
+./build.sh
+node tools/sim.mjs web/obby.wasm
+```
+The run timer starts when PLAY is clicked. The checks cover this lifecycle in Rust and through the WebAssembly API.
