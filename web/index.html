@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neon Obby</title>
+<style>
+  :root { --ink: #fff; --panel: rgba(10, 14, 24, 0.55); --accent: #3fa9ff; }
+  html, body { margin: 0; height: 100%; background: #0b0f18; overflow: hidden; font-family: "Trebuchet MS", system-ui, sans-serif; color: var(--ink); }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; cursor: crosshair; }
+  .hud { position: fixed; top: 14px; left: 14px; display: flex; gap: 8px; pointer-events: none; }
+  .chip { background: var(--panel); backdrop-filter: blur(6px); border-radius: 10px; padding: 8px 12px; min-width: 64px; }
+  .chip b { display: block; font-size: 20px; letter-spacing: .5px; }
+  .chip span { font-size: 11px; opacity: .75; text-transform: uppercase; letter-spacing: 1px; }
+  #perf { position: fixed; top: 14px; right: 14px; background: var(--panel); border-radius: 8px; padding: 6px 10px; font: 12px ui-monospace, monospace; pointer-events: none; }
+  #help { position: fixed; bottom: 14px; left: 14px; background: var(--panel); border-radius: 10px; padding: 10px 14px; font-size: 13px; line-height: 1.6; pointer-events: none; }
+  #help.hidden { display: none; }
+  kbd { background: rgba(255,255,255,.15); border-radius: 4px; padding: 1px 6px; font-family: inherit; }
+  #msg { position: fixed; top: 22%; left: 0; right: 0; text-align: center; font-size: 34px; font-weight: 800; text-shadow: 0 3px 0 #0006; opacity: 0; transition: opacity .3s; pointer-events: none; }
+  .overlay { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 14px; background: radial-gradient(ellipse at center, #0b0f1855, #0b0f18cc); text-align: center; padding: 16px; }
+  .overlay h1 { margin: 0; font-size: clamp(40px, 9vw, 84px); letter-spacing: 2px; text-shadow: 0 5px 0 #0007; }
+  .overlay p { margin: 0; max-width: 520px; opacity: .85; }
+  button { font: inherit; font-size: 22px; font-weight: 800; color: #fff; background: #00a2ff; border: 0; border-radius: 12px; padding: 14px 40px; cursor: pointer; box-shadow: 0 5px 0 #0068a8; }
+  button:active { transform: translateY(3px); box-shadow: 0 2px 0 #0068a8; }
+  #win { display: none; pointer-events: none; }
+  #err { display: none; position: fixed; inset: auto 16px 16px 16px; background: #a0222a; padding: 12px 16px; border-radius: 10px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div class="hud">
+  <div class="chip"><span>Stage</span><b id="stage">0 / 0</b></div>
+  <div class="chip"><span>Deaths</span><b id="deaths">0</b></div>
+  <div class="chip"><span>Time</span><b id="time">0:00.00</b></div>
+</div>
+<div id="perf"></div>
+<div id="msg"></div>
+<div id="help">
+  <kbd>WASD</kbd> move · <kbd>Space</kbd> jump · mouse / right‑drag look · wheel zoom<br>
+  <kbd>R</kbd> ray tracing on/off · <kbd>G</kbd> render scale · <kbd>K</kbd> respawn · <kbd>T</kbd> restart · <kbd>H</kbd> hide
+</div>
+
+<div class="overlay" id="start">
+  <h1>NEON OBBY</h1>
+  <p>Ten stages over a lava sea. Rust → WebAssembly runs the physics and rebuilds a BVH every frame; WebGPU rasterizes a G‑buffer, then a compute pass ray traces shadows, AO, mirrors and glass.</p>
+  <button>PLAY</button>
+</div>
+
+<div class="overlay" id="win">
+  <h1>YOU WIN!</h1>
+  <p>Time <b id="wintime"></b> · Deaths <b id="windeaths"></b> · press <kbd>T</kbd> to run it again</p>
+</div>
+
+<div id="err"></div>
+<script type="module" src="main.js"></script>
+</body>
+</html>
