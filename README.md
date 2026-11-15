@@ -31,12 +31,16 @@ A Roblox-style obstacle course running in the browser, with three renderers: a p
 ## Asynchronous reprojection (timewarp)
 Press `F` to separate the display rate from the render rate. A second WebGPU device does only one thing: every display refresh it warps the newest finished frame to the current camera. It unprojects each pixel with that frame's depth and inverse view-projection, reprojects it with the latest camera, and solves for the inverse with a 6-step fixed-point iteration. The scene device renders at its own pace, with a 1.2× field-of-view overscan so fast turns don't expose edges. Each finished colour and depth frame is handed to the presenting device through a mapped staging buffer.
 
-Because the presenting device's queue never waits behind a 60–100 ms path-traced frame, camera motion stays at display rate (60 fps while ReSTIR PT renders at about 15). `V` caps the scene rate so you can see the effect. Known limitations: there are no motion vectors, so moving objects such as the player judder at the scene rate, and disocclusions stretch. If a second device isn't available, the warp runs on the scene device; that path is correct but gives no async benefit.
+Because the presenting device's queue never waits behind a 60–100 ms path-traced frame, camera motion stays at display rate (60 fps while ReSTIR PT renders at about 15). `V` caps the scene rate so you can see the effect. **Freeze frame (`X`)** stops scene rendering and keeps warping the last frame, so you can walk the camera around a single still image and see how far reprojection holds up.
+
+**Infill.** Each display pixel first tries a cheap fixed-point solve. Where that fails (steep parallax or a large camera move), it marches the pixel's epipolar line through the source frame from near to far. The first point where the view ray passes behind the stored depth is the visible surface, found with a bisection. If the stored depth jumps at that crossing, the ray went behind a foreground object: that's a disocclusion, and it's filled with a depth-weighted blur of the background next to it instead of stretched foreground. Areas beyond the overscan border get a blur that widens with distance. `J` tints filled holes magenta and filled edges cyan; `I` compares against the plain warp.
+
+Known limitations: there are no motion vectors, so moving objects such as the player judder at the scene rate, and disocclusions stretch. If a second device isn't available, the warp runs on the scene device; that path is correct but gives no async benefit.
 
 Needs a WebGPU browser (Chrome/Edge, Safari 26+).
 
 ## Controls
-`WASD` move · `Space` jump · mouse / right-drag look · wheel zoom · `R` raster lighting ↔ ray tracing · `P` (in ray tracing) ReSTIR PT Enhanced ↔ hybrid · `G` render scale · `F` asynchronous reprojection · `V` cycle scene fps cap (∞/30/15/8) · `K` respawn · `T` restart · `M` mute · `H` hide help
+`WASD` move · `Space` jump · mouse / right-drag look · wheel zoom · `R` raster lighting ↔ ray tracing · `P` (in ray tracing) ReSTIR PT Enhanced ↔ hybrid · `G` render scale · `F` asynchronous reprojection · `V` cycle scene fps cap (∞/30/15/8) · `X` freeze frame · `I` infill on/off · `J` tint filled holes · `K` respawn · `T` restart · `M` mute · `H` hide help
 
 ## Sound
 Eleven original Web Audio effects cover starting, jumping, landing, footsteps, bounce pads, checkpoints, death, respawning, restarting, UI changes, and winning. Layered tones and filtered noise are synthesized locally; no sound files or external services are needed. Footsteps vary in pitch and alternate subtly between left and right, while landing volume follows time spent airborne.

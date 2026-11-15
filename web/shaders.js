@@ -2453,7 +2453,10 @@ fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_ind
 // camera rotation and translation; the sky, at infinite depth, warps as pure rotation).
 // DEPTH_DECL / DEPTH_LOAD are patched for a depth32float (same device) or r32float (2nd device) source.
 export const WARP_WGSL = /* wgsl */ `
-struct WU { newVP: mat4x4f, oldInvVP: mat4x4f, info: vec4f };   // info.xy = depth size
+// newVP: current camera; oldInvVP: the source frame's inverse VP;
+// back = oldVP * newInvVP (current NDC -> source clip, used to seed the search);
+// info.xy = source depth size, info.zw = output size; opt.x = infill on, opt.y = tint holes
+struct WU { newVP: mat4x4f, oldInvVP: mat4x4f, back: mat4x4f, info: vec4f, opt: vec4f };
 @group(0) @binding(0) var<uniform> wu: WU;
 @group(0) @binding(1) var src: texture_2d<f32>;
 DEPTH_DECL
@@ -2464,33 +2467,176 @@ DEPTH_DECL
   return vec4f(p * 2.0 - 1.0, 0.0, 1.0);
 }
 
-fn depthAt(uv: vec2f) -> f32 {
-  let dp = clamp(vec2i(uv * wu.info.xy), vec2i(0), vec2i(wu.info.xy) - 1);
+fn depthTexel(q: vec2i) -> f32 {
+  let dp = clamp(q, vec2i(0), vec2i(wu.info.xy) - 1);
   return DEPTH_LOAD;
 }
+// Bilinear depth on continuous surfaces (so the search sees a smooth function on slopes),
+// nearest texel across a real depth edge (so layers never blend into a fake middle surface).
+fn depthAt(uv: vec2f) -> f32 {
+  let f = uv * wu.info.xy - 0.5;
+  let q = vec2i(floor(f));
+  let t = f - floor(f);
+  let a = depthTexel(q); let b = depthTexel(q + vec2i(1, 0));
+  let c = depthTexel(q + vec2i(0, 1)); let d = depthTexel(q + vec2i(1, 1));
+  let lo = min(min(a, b), min(c, d)); let hi = max(max(a, b), max(c, d));
+  if (hi - lo > 0.08 * hi + 1e-5) { return depthTexel(vec2i(uv * wu.info.xy)); }
+  return mix(mix(a, b, t.x), mix(c, d, t.x), t.y);
+}
+fn ndc(uv: vec2f) -> vec2f { return vec2f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0); }
 fn warpTo(s: vec2f) -> vec3f {   // where source uv s lands on screen now (z = 1 if in front)
   let d = depthAt(s);
-  let P = wu.oldInvVP * vec4f(s.x * 2.0 - 1.0, 1.0 - s.y * 2.0, d, 1.0);
-  let c = wu.newVP * P;
-  if (c.w <= 1e-6) { return vec3f(0.0); }
+  let c = wu.newVP * (wu.oldInvVP * vec4f(ndc(s), d, 1.0));
+  if (c.w <= 1e-6) { return vec3f(-9.0, -9.0, 0.0); }
   return vec3f(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5, 1.0);
+}
+fn seed(uv: vec2f, d: f32) -> vec2f {   // where uv would come from if it were at reversed-Z depth d
+  let c = wu.back * vec4f(ndc(uv), d, 1.0);
+  if (c.w <= 1e-6) { return uv; }
+  return vec2f(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5);
+}
+// Fixed-point search for the source texel that lands on uv. Returns (s, residual in output px).
+fn solve(uv: vec2f, start: vec2f) -> vec3f {
+  // Back-projection iteration: assume the depth stored at the current guess and map uv back into
+  // the source frame through it. Exact once the guess sits on the right surface; it converges
+  // from far larger camera motion than the screen-space update s += uv - warp(s).
+  var s = start;
+  for (var i = 0; i < 8; i++) {
+    let n = clamp(seed(uv, depthAt(clamp(s, vec2f(0.0), vec2f(1.0)))), vec2f(-0.3), vec2f(1.3));
+    if (all(abs(n - s) < vec2f(1e-5))) { s = n; break; }
+    s = n;
+  }
+  // a couple of screen-space steps polish the result on sloped or edge texels
+  for (var i = 0; i < 2; i++) {
+    let w = warpTo(clamp(s, vec2f(0.0), vec2f(1.0)));
+    if (w.z == 0.0) { break; }
+    s = clamp(s + (uv - w.xy), vec2f(-0.3), vec2f(1.3));
+  }
+  let w = warpTo(clamp(s, vec2f(0.0), vec2f(1.0)));
+  let r = select(1e9, length((w.xy - uv) * wu.info.zw), w.z > 0.0);
+  return vec3f(s, r);
+}
+fn tap(s: vec2f) -> vec3f {
+  let size = vec2f(textureDimensions(src));
+  return textureSampleLevel(src, samp, clamp(s, vec2f(0.5) / size, vec2f(1.0) - vec2f(0.5) / size), 0.0).rgb;
+}
+const GOLDEN = 2.39996323;
+
+fn toUv(h: vec4f) -> vec2f { return vec2f(h.x / h.w * 0.5 + 0.5, 0.5 - h.y / h.w * 0.5); }
+fn nearestDepth(p: vec2f) -> f32 { return depthTexel(vec2i(clamp(p, vec2f(0.0), vec2f(1.0)) * wu.info.xy)); }
+
+struct Hit { s: vec2f, ok: bool, bg: vec2f, hole: bool };
+// Epipolar search. The current pixel's view ray, as a function of its reversed-Z depth d, traces
+// a line in the source image: p(d) = toUv(A + d*B). March it from the near end towards infinity
+// in equal screen steps; the first place the ray falls behind the stored depth is the visible
+// surface. If the stored depth jumps there, the ray slipped behind a foreground object: the
+// true surface was never rendered (disocclusion), and the sample before the jump is background.
+fn epipolar(uv: vec2f) -> Hit {
+  var h: Hit; h.ok = false; h.hole = false;
+  let A = wu.back * vec4f(ndc(uv), 0.0, 1.0);
+  let B = wu.back[2];
+  let eps = 1e-4;
+  var dF = 0.0; var dN = 1.0;
+  if (A.w <= eps) { if (B.w <= 0.0) { return h; } dF = (eps - A.w) / B.w * 1.01; }
+  if (A.w + dN * B.w <= eps) { if (B.w >= 0.0) { return h; } dN = (eps - A.w) / B.w * 0.99; }
+  if (dN <= dF) { return h; }
+  let H0 = A + dF * B; let H1 = A + dN * B;
+  let p0 = toUv(H0); let p1 = toUv(H1);
+  // clip the segment to the source image (plus a little margin)
+  let dlt = p1 - p0;
+  var tA = 0.0; var tB = 1.0;
+  for (var k = 0; k < 2; k++) {
+    if (abs(dlt[k]) < 1e-7) { if (p0[k] < -0.02 || p0[k] > 1.02) { return h; } continue; }
+    let ta = (-0.02 - p0[k]) / dlt[k]; let tb = (1.02 - p0[k]) / dlt[k];
+    tA = max(tA, min(ta, tb)); tB = min(tB, max(ta, tb));
+  }
+  if (tA >= tB) { return h; }
+  // projective interpolation: depth of the ray at screen parameter t
+  let w0 = H0.w; let w1 = H1.w;
+  let N = 40;
+  var tPrev = tB; var hit = false; var tHit = tB;
+  for (var i = 0; i <= N; i++) {
+    let t = mix(tB, tA, f32(i) / f32(N));
+    let k0 = (1.0 - t) / w0; let k1 = t / w1;
+    let dr = (k0 * dF + k1 * dN) / (k0 + k1);
+    if (dr <= nearestDepth(mix(p0, p1, t))) { hit = true; tHit = t; break; }
+    tPrev = t;
+  }
+  if (!hit) { return h; }
+  // bisection between the last "in front" and the first "behind" sample
+  var lo = tPrev; var hi = tHit;
+  if (tHit != tB) {
+    for (var i = 0; i < 6; i++) {
+      let t = 0.5 * (lo + hi);
+      let k0 = (1.0 - t) / w0; let k1 = t / w1;
+      let dr = (k0 * dF + k1 * dN) / (k0 + k1);
+      if (dr <= depthAt(clamp(mix(p0, p1, t), vec2f(0.0), vec2f(1.0)))) { hi = t; } else { lo = t; }
+    }
+  }
+  let k0 = (1.0 - hi) / w0; let k1 = hi / w1;
+  let dr = (k0 * dF + k1 * dN) / (k0 + k1);
+  h.s = mix(p0, p1, hi);
+  let ds = nearestDepth(h.s);
+  h.ok = true;
+  h.hole = abs(ds - dr) > 0.12 * max(ds, dr) + 1e-5;
+  h.bg = mix(p0, p1, lo);
+  return h;
 }
 
 @fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
-  let size = vec2f(textureDimensions(src));
-  let outSize = wu.info.zw;
-  let uv = fc.xy / outSize;
-  var s = uv;
-  for (var i = 0; i < 6; i++) {
-    let w = warpTo(clamp(s, vec2f(0.0), vec2f(1.0)));
-    if (w.z == 0.0) { break; }
-    s += uv - w.xy;
+  let uv = fc.xy / wu.info.zw;
+  let infill = wu.opt.x > 0.5;
+  var s: vec2f; var hole = false; var bgS = vec2f(0.0); var noData = false;
+  if (!infill) {
+    s = solve(uv, uv).xy;      // plain fixed-point warp, for comparison
+  } else {
+    // fast path: converges in a few steps wherever the motion is small
+    let f = solve(uv, seed(uv, depthAt(uv)));
+    if (f.z < 1.0) { s = f.xy; }
+    else {
+      let e = epipolar(uv);
+      if (e.ok) { s = e.s; hole = e.hole; bgS = e.bg; }
+      else { s = seed(uv, 0.0); noData = true; }
+    }
   }
-  let inside = all(s >= vec2f(0.0)) && all(s <= vec2f(1.0));
-  var c = textureSampleLevel(src, samp, clamp(s, vec2f(0.5) / size, vec2f(1.0) - vec2f(0.5) / size), 0.0).rgb;
-  if (!inside) {   // beyond the overscan border: stretch the edge, slightly darkened
+  let inside = all(s >= vec2f(0.0)) && all(s <= vec2f(1.0)) && !noData;
+  var c = tap(s);
+
+  if (hole) {
+    // Disocclusion: fill from the background side with a depth-weighted disc blur so it reads as
+    // soft background rather than foreground smeared over the hole.
+    let aspect = vec2f(wu.info.w / wu.info.z, 1.0);
+    let bgD = nearestDepth(bgS);
+    var acc = vec3f(0.0); var wsum = 0.0;
+    for (var i = 0; i < 12; i++) {
+      let fi = f32(i) + 0.5;
+      let a = fi * GOLDEN;
+      let p = bgS + vec2f(cos(a), sin(a)) * sqrt(fi / 12.0) * 0.012 * aspect;
+      let d = nearestDepth(p);
+      let wgt = select(0.05, 1.0, d <= bgD * 1.15 + 1e-5);   // reject foreground taps
+      acc += tap(p) * wgt; wsum += wgt;
+    }
+    c = acc / wsum;
+    if (wu.opt.y > 0.5) { c = mix(c, vec3f(1.0, 0.0, 1.0), 0.6); }
+  }
+  if (!inside) {
+    // Beyond the overscan border: the old frame has no data. Infill with a blur that grows with
+    // the distance past the edge (no hard smear lines), slightly darkened.
     let o = max(max(-s, s - 1.0), vec2f(0.0));
-    c *= 1.0 - clamp(length(o) * 4.0, 0.0, 0.5);
+    let dist = length(o);
+    if (infill) {
+      let e = clamp(s, vec2f(0.0), vec2f(1.0));
+      let r = 0.01 + dist * 0.6;
+      var acc = vec3f(0.0);
+      for (var i = 0; i < 12; i++) {
+        let fi = f32(i) + 0.5;
+        let a = fi * GOLDEN;
+        acc += tap(e + vec2f(cos(a), sin(a)) * sqrt(fi / 12.0) * r);
+      }
+      c = acc / 12.0;
+      if (wu.opt.y > 0.5) { c = mix(c, vec3f(0.0, 1.0, 1.0), 0.5); }
+    }
+    c *= 1.0 - clamp(dist * 2.5, 0.0, 0.35);
   }
   return vec4f(c, 1.0);
 }

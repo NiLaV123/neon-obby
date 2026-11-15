@@ -247,7 +247,7 @@ async function main() {
     fragment: { module: warpMod, entryPoint: 'fs', targets: [{ format }] },
     primitive: { topology: 'triangle-list' },
   });
-  const warpUni = pdev.createBuffer({ size: 36 * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const warpUni = pdev.createBuffer({ size: 56 * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const warpSamp = pdev.createSampler({ magFilter: 'linear', minFilter: 'linear' });
   const OVERSCAN = 1.2;   // async mode renders a wider field of view so fast turns don't show edges
   let warp = null;        // per-resize: source textures, staging buffers, bind groups
@@ -569,6 +569,13 @@ async function main() {
     if (e.code === 'KeyG') { scaleIdx = (scaleIdx + 1) % SCALES.length; renderScale = SCALES[scaleIdx]; flashMsg(`Render scale ${Math.round(renderScale * 100)}%`); }
     if (e.code === 'KeyF') { setAsync(!asyncOn); flashMsg(asyncOn ? `Async reprojection ON${twoDev ? '' : ' (single device)'}` : 'Async reprojection OFF'); }
     if (e.code === 'KeyV') { capIdx = (capIdx + 1) % SCENE_CAPS.length; flashMsg(SCENE_CAPS[capIdx] ? `Scene capped at ${SCENE_CAPS[capIdx]} fps` : 'Scene uncapped'); }
+    if (e.code === 'KeyX') {   // freeze: keep warping the last finished frame, render nothing new
+      if (!asyncOn) setAsync(true);
+      frozen = !frozen;
+      flashMsg(frozen ? 'Frame frozen — look around (X to unfreeze)' : 'Unfrozen');
+    }
+    if (e.code === 'KeyI') { infillOn = !infillOn; flashMsg(`Infill ${infillOn ? 'ON' : 'OFF'}`); }
+    if (e.code === 'KeyJ') { showHoles = !showHoles; flashMsg(`Hole tint ${showHoles ? 'ON' : 'OFF'}`); }
     if (e.code === 'KeyK') { w.respawn(); movementSounds.reset(); if (playing) sounds.play('respawn'); }
     if (e.code === 'KeyT') { w.restart(); movementSounds.reset(); if (playing) sounds.play('restart'); $('win').style.display = 'none'; }
     if (e.code === 'KeyH') $('help').classList.toggle('hidden');
@@ -765,7 +772,8 @@ async function main() {
   const SCENE_CAPS = [0, 30, 15, 8];   // 0 = as fast as the GPU allows
   let asyncOn = false, capIdx = 0, sceneBusy = false, lastSceneT = -1e9, warpSrc = null, warpInFlight = 0;
   let sceneCount = 0, sceneT0 = performance.now(), sceneFps = 0, lastNb = 0, lastNl = 0;
-  const wu = new Float32Array(36);
+  const wu = new Float32Array(56);
+  let frozen = false, infillOn = true, showHoles = false;
 
   function startAsyncScene(now, eye, target) {
     const p = frameNo & 1;
@@ -777,10 +785,10 @@ async function main() {
     });
     sceneBusy = true;
     // one device: the queue already orders the warp after this frame, so present it right away
-    if (!twoDev) warpSrc = { invVP: r.invVP, par: r.par, W, H };
+    if (!twoDev) warpSrc = { vp: r.vp, invVP: r.invVP, par: r.par, W, H };
     const t0 = performance.now();
     const done = () => {
-      warpSrc = { invVP: r.invVP, par: r.par, W, H };
+      warpSrc = { vp: r.vp, invVP: r.invVP, par: r.par, W, H };
       sceneBusy = false;
       sceneCount++;
       gpuMs = gpuMs * 0.8 + (performance.now() - t0) * 0.2;
@@ -805,7 +813,9 @@ async function main() {
     const vp = m4.mul(m4.persp(FOV, W / H, 0.1), view);
     wu.set(vp, 0);
     wu.set(warpSrc.invVP, 16);
-    wu.set([warpSrc.W, warpSrc.H, CW, CH], 32);
+    wu.set(m4.mul(warpSrc.vp, m4.inv(vp)), 32);
+    wu.set([warpSrc.W, warpSrc.H, CW, CH], 48);
+    wu.set([infillOn ? 1 : 0, showHoles ? 1 : 0, 0, 0], 52);
     pdev.queue.writeBuffer(warpUni, 0, wu);
     const enc = pdev.createCommandEncoder();
     const rp = enc.beginRenderPass({
@@ -822,6 +832,7 @@ async function main() {
   function setAsync(on) {
     asyncOn = on;
     warpSrc = null;
+    if (!on) frozen = false;
     if (twoDev) ctx.configure({ device: on ? pdev : device, format, alphaMode: 'opaque' });
   }
 
@@ -870,7 +881,7 @@ async function main() {
       device.queue.onSubmittedWorkDone().then(() => { inFlight--; gpuMs = gpuMs * 0.9 + (performance.now() - t0) * 0.1; });
     } else {
       const cap = SCENE_CAPS[capIdx];
-      if (!sceneBusy && (cap === 0 || now - lastSceneT >= 1000 / cap - 2)) {
+      if (!sceneBusy && !(frozen && warpSrc) && (cap === 0 || now - lastSceneT >= 1000 / cap - 2)) {
         lastSceneT = now;
         const r = startAsyncScene(now, eye, target);
         nb = r.nb; nl = r.nl;
@@ -887,7 +898,7 @@ async function main() {
     if (now - sceneT0 > 500) { sceneFps = sceneCount * 1000 / (now - sceneT0); sceneCount = 0; sceneT0 = now; }
     const mode = rtOn ? (ptOn ? 'ReSTIR PT Enhanced' : 'hybrid RT') : `raster GI · ${nl} lights`;
     $('perf').textContent = asyncOn
-      ? `timewarp ${fps.toFixed(0)} fps · scene ${sceneFps.toFixed(0)} fps${SCENE_CAPS[capIdx] ? ` (cap ${SCENE_CAPS[capIdx]})` : ''} · ${W}×${H} · ${mode}`
+      ? `timewarp ${fps.toFixed(0)} fps · ${frozen ? 'FROZEN' : `scene ${sceneFps.toFixed(0)} fps`}${SCENE_CAPS[capIdx] ? ` (cap ${SCENE_CAPS[capIdx]})` : ''} · ${W}×${H} · ${mode}`
       : `${fps.toFixed(0)} fps · ${gpuMs.toFixed(1)} ms · ${W}×${H} · ${nb} boxes · ${mode}`;
     if (msgTimer > 0) { msgTimer -= dt; if (msgTimer <= 0) $('msg').style.opacity = 0; }
     requestAnimationFrame(tick);
