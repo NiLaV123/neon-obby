@@ -8,7 +8,7 @@ A Roblox-style obstacle course running in the browser, with three renderers: a p
 - **Raster lighting** (default; how a shipped game lights a scene — no per-pixel ray tracing):
   - **Hand-placed lights**: 40 point lights authored in the Rust level (neon letters, hazard glows that ride on spinners and sliders, checkpoint pads, uplights, under-glass fills, the win arch), with **tiled light culling** (8×8 tiles, world-space tile bounds reduced in shared memory).
   - **Cascaded shadow maps**: 3 × 2048² sun cascades fitted to frustum slices and texel-snapped, with **PCSS** contact-hardening soft shadows (blocker search + rotated 16-tap Poisson PCF).
-  - **DDGI irradiance probes**: a 24×12×32 grid (3-stud spacing) that scrolls with the player using toroidal addressing; half of the probes trace 48 rays per frame through the BVH (sun, local lights, emission and last frame's probes → infinite bounces), blended into 8×8 octahedral irradiance and 16×16 depth-moment maps with hysteresis; Chebyshev visibility and backface weights stop leaks, probes stuck inside geometry are switched off.
+  - **DDGI irradiance probes**: a 24×12×32 grid (3-stud spacing) that scrolls with the player using toroidal addressing; a quarter of the probes trace 48 rays per frame through the BVH (sun, local lights, emission and last frame's probes → infinite bounces), blended into 8×8 octahedral irradiance and 16×16 depth-moment maps with hysteresis; Chebyshev visibility and backface weights stop leaks, probes stuck inside geometry are switched off.
   - **AO**: half-resolution horizon-based ambient occlusion with a depth-aware upsampling blur, applied with multi-bounce AO and specular occlusion.
   - **Shading**: GGX specular per material (plastic, smooth, polished, metal), split-sum environment BRDF, **screen-space reflections** from last frame's image over a probe/sky fallback (sky visibility from the probe depth maps).
   - **Forward transparency** for glass and blinking ghost blocks (Fresnel, sun glint, probe-lit body).
@@ -40,7 +40,19 @@ Known limitations: there are no motion vectors, so moving objects such as the pl
 Needs a WebGPU browser (Chrome/Edge, Safari 26+).
 
 ## Controls
-`WASD` move · `Space` jump · mouse / right-drag look · wheel zoom · `R` raster lighting ↔ ray tracing · `P` (in ray tracing) ReSTIR PT Enhanced ↔ hybrid · `G` render scale · `F` asynchronous reprojection · `V` cycle scene fps cap (∞/30/15/8) · `X` freeze frame · `I` infill on/off · `J` tint filled holes · `K` respawn · `T` restart · `M` mute · `H` hide help
+`WASD` move · `Space` jump · mouse / right-drag look · wheel zoom · `R` raster lighting ↔ ray tracing · `P` (in ray tracing) ReSTIR PT Enhanced ↔ hybrid · `G` render scale · `Q` auto scale · `F` asynchronous reprojection · `V` cycle scene fps cap (∞/30/15/8) · `X` freeze frame · `I` infill on/off · `J` tint filled holes · `K` respawn · `T` restart · `M` mute · `H` hide help
+
+## Performance
+Automatic render scaling targets a 60 fps frame budget. It reduces internal resolution after sustained slow GPU submissions and restores detail gradually when there is headroom. The HUD shows the current resolution and automatic scale. `G` chooses the maximum scale; `Q` disables automatic scaling for a fixed resolution. Automatic scaling stays within 50–100% of the chosen scale and adjusts at most once per second. Capped or frozen asynchronous scenes do not drive the controller.
+
+Raster and hybrid lighting update the complete probe volume over four frames, halving per-frame probe tracing and blending work. The probe count, rays per probe, and map resolution stay the same; moving lighting updates are spread over four frames. Hysteresis is adjusted to preserve the previous temporal decay rate. Render targets are resized after queued work finishes, and old timewarp staging buffers are released.
+
+For a repeatable native WebGPU benchmark of the actual renderer, install the optional Dawn package outside the repository:
+```sh
+npm install --prefix /tmp/neon-obby-bench webgpu
+NODE_PATH=/tmp/neon-obby-bench/node_modules node tools/bench-render.mjs
+```
+The benchmark renders offscreen at a 960×540 viewport after five warm-up frames, checks WebGPU validation errors, and reports frame times. Set `BENCH_WIDTH`, `BENCH_HEIGHT`, `BENCH_FRAMES`, or `BENCH_MODE` (`raster`, `hybrid`, `pt`, `async`) to compare workloads; `BENCH_AUTO=0` fixes the render scale. These timings exclude browser presentation and are not a guarantee of browser fps.
 
 ## Sound
 Eleven original Web Audio effects cover starting, jumping, landing, footsteps, bounce pads, checkpoints, death, respawning, restarting, UI changes, and winning. Layered tones and filtered noise are synthesized locally; no sound files or external services are needed. Footsteps vary in pitch and alternate subtly between left and right, while landing volume follows time spent airborne.
@@ -60,7 +72,7 @@ Pushing to `main` builds and deploys to GitHub Pages via `.github/workflows/page
 ## Checks
 ```sh
 cargo test --locked
-node --test tools/audio.test.mjs
+node --test tools/*.test.mjs
 ./build.sh
 node tools/sim.mjs web/obby.wasm
 ```

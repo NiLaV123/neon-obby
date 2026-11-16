@@ -17,7 +17,7 @@ struct U {
   sunDir: vec4f,   // xyz to-sun, w frame
   res: vec4f,      // w, h, rt on, box count
   misc: vec4f,     // x flash, y exposure, zw canvas size
-  opts: vec4f,     // x ReSTIR PT Enhanced on
+  opts: vec4f,     // x ReSTIR PT Enhanced on, y probe stride, z probe phase
   prevCam: vec4f,  // previous frame camera position
   pair: array<vec4f, 3>,  // per-frame transforms of the 3 pairing textures (flags, offset)
   // ---- raster lighting
@@ -1680,8 +1680,9 @@ fn sphFib(i: u32) -> vec3f {
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
   let t = gid.x;
-  if (t >= PCOUNT / 2u * PRAYS) { return; }
-  let slot = (t / PRAYS) * 2u + (u32(u.probeInfo.y) & 1u);   // half the probes each frame
+  let stride = u32(u.opts.y);
+  if (t >= PCOUNT / stride * PRAYS) { return; }
+  let slot = (t / PRAYS) * stride + u32(u.opts.z);
   let ri = t % PRAYS;
   let ro = slot * PRAYS + ri;
   let o = probePos(cellOfSlot(slot));
@@ -1737,7 +1738,8 @@ var<workgroup> backs: atomic<u32>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) li: u32) {
-  let slot = wg.x * 2u + (u32(u.probeInfo.y) & 1u);
+  let stride = u32(u.opts.y);
+  let slot = wg.x * stride + u32(u.opts.z);
   if (li == 0u) { atomicStore(&backs, 0u); }
   workgroupBarrier();
   if (li < PRAYS) {

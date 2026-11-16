@@ -1,6 +1,7 @@
 import { RASTER_WGSL, TRACE_WGSL, PT_TEMPORAL_WGSL, PT_PREPASS_WGSL, PT_RESAMPLE_WGSL, PT_DUP_WGSL, DN_ACCUM_WGSL, DN_ATROUS_WGSL, SHADE_WGSL, POST_WGSL,
   SHADOW_WGSL, PROBE_TRACE_WGSL, PROBE_UPDATE_WGSL, AO_WGSL, AO_BLUR_WGSL, LIGHT_WGSL, TRANSPARENT_WGSL, BLOOM_DOWN_WGSL, BLOOM_UP_WGSL, WARP_WGSL } from './shaders.js';
 import { SoundLibrary, MovementSounds } from './audio.js';
+import { RenderBudget, probeSchedule } from './performance.js';
 
 const $ = (id) => document.getElementById(id);
 const canvas = $('c');
@@ -163,6 +164,9 @@ async function main() {
   // ---- raster lighting resources (fixed size)
   const SM_SIZE = 2048, CASCADES = 3;
   const PROBES = 24 * 12 * 32, PRAYS = 48, PROBE_SPACING = 3, MAX_LIGHTS = 256;
+  const PROBE_STRIDE = 4; // Update one quarter of the volume each frame.
+  const renderBudget = new RenderBudget();
+  let autoScale = true;
   const shadowPipe = device.createRenderPipeline({
     layout: 'auto',
     vertex: { module: mod(SHADOW_WGSL, 'shadow'), entryPoint: 'vs' },
@@ -324,6 +328,13 @@ async function main() {
   const pairTex = [254, 230, 210].map((sz) => makePairTexture(sz, PAIR_SIGMA, rand));
 
   let CW = 0, CH = 0, W = 0, H = 0, tex = null, views = null, bufs = null, renderScale = 0.75, clearPT = true;
+  let resizePending = true;
+  addEventListener('resize', () => { resizePending = true; });
+  function observeFrame(elapsed) {
+    const previousScale = renderBudget.scale;
+    renderBudget.observe(elapsed, performance.now());
+    if (renderBudget.scale !== previousScale) resizePending = true;
+  }
   let BG = null, bloomPasses = []; // per-parity bind groups, bloom chain
   const RT = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING;
   const ST = GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING;
@@ -335,11 +346,13 @@ async function main() {
     if (canvas.width !== cw || canvas.height !== ch) { canvas.width = cw; canvas.height = ch; }
     // Path tracing costs ~30 software-BVH rays per pixel, so in PT mode the internal resolution is
     // capped to a pixel budget (~960x540 at the default scale; G scales the budget too).
-    let sc = renderScale;
-    if (rtOn && ptOn) sc = Math.min(sc, Math.sqrt(PT_PIXEL_BUDGET * (renderScale / 0.75) ** 2 / (cw * ch)));
+    const requestedScale = renderScale * (autoScale ? renderBudget.scale : 1);
+    let sc = requestedScale;
+    if (rtOn && ptOn) sc = Math.min(sc, Math.sqrt(PT_PIXEL_BUDGET * (requestedScale / 0.75) ** 2 / (cw * ch)));
     const nw = Math.max(1, Math.floor(cw * sc)), nh = Math.max(1, Math.floor(ch * sc));
     if (nw === W && nh === H && cw === CW && ch === CH && tex) return;
     W = nw; H = nh; CW = cw; CH = ch;
+    warpSrc = null;
     if (warp) { for (const t of warp.own) t.destroy(); warp = null; }
     if (tex) for (const t of Object.values(tex)) t.destroy();
     if (bufs) for (const b of Object.values(bufs)) b.destroy();
@@ -417,7 +430,7 @@ async function main() {
         const stC = device.createBuffer({ size: cbpr * CH, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
         const stD = device.createBuffer({ size: dbpr * H, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
         const g = wbg(sc.createView(), sd.createView());
-        warp = { own: [sc, sd], sc, sd, stC, stD, cbpr, dbpr, bg: [g, g] };
+        warp = { own: [sc, sd, stC, stD], sc, sd, stC, stD, cbpr, dbpr, bg: [g, g] };
       } else {
         warp = { own: [], cbpr, dbpr, bg: [wbg(v.ldr0, v.depth0), wbg(v.ldr1, v.depth1)] };
       }
@@ -564,9 +577,10 @@ async function main() {
     keys.add(e.code);
     if (e.code === 'Space') e.preventDefault();
     if (e.repeat) return;
-    if (e.code === 'KeyR') { rtOn = !rtOn; clearPT = true; flashMsg(rtOn ? (ptOn ? 'ReSTIR PT Enhanced' : 'Hybrid ray tracing') : 'Raster lighting: probes + lights + shadow maps'); }
-    if (e.code === 'KeyP') { ptOn = !ptOn; clearPT = true; flashMsg(ptOn ? 'ReSTIR PT Enhanced ON' : 'Hybrid RT: traced shadows + reflections, probe GI, lights'); }
-    if (e.code === 'KeyG') { scaleIdx = (scaleIdx + 1) % SCALES.length; renderScale = SCALES[scaleIdx]; flashMsg(`Render scale ${Math.round(renderScale * 100)}%`); }
+    if (e.code === 'KeyR') { rtOn = !rtOn; clearPT = true; renderBudget.reset(performance.now()); resizePending = true; flashMsg(rtOn ? (ptOn ? 'ReSTIR PT Enhanced' : 'Hybrid ray tracing') : 'Raster lighting: probes + lights + shadow maps'); }
+    if (e.code === 'KeyP') { ptOn = !ptOn; clearPT = true; renderBudget.reset(performance.now()); resizePending = true; flashMsg(ptOn ? 'ReSTIR PT Enhanced ON' : 'Hybrid RT: traced shadows + reflections, probe GI, lights'); }
+    if (e.code === 'KeyG') { scaleIdx = (scaleIdx + 1) % SCALES.length; renderScale = SCALES[scaleIdx]; renderBudget.reset(performance.now()); resizePending = true; flashMsg(`Render scale ${Math.round(renderScale * 100)}%`); }
+    if (e.code === 'KeyQ') { autoScale = !autoScale; renderBudget.reset(performance.now()); resizePending = true; flashMsg(autoScale ? 'Auto render scale ON (target 60 fps)' : 'Auto render scale OFF'); }
     if (e.code === 'KeyF') { setAsync(!asyncOn); flashMsg(asyncOn ? `Async reprojection ON${twoDev ? '' : ' (single device)'}` : 'Async reprojection OFF'); }
     if (e.code === 'KeyV') { capIdx = (capIdx + 1) % SCENE_CAPS.length; flashMsg(SCENE_CAPS[capIdx] ? `Scene capped at ${SCENE_CAPS[capIdx]} fps` : 'Scene uncapped'); }
     if (e.code === 'KeyX') {   // freeze: keep warping the last finished frame, render nothing new
@@ -580,7 +594,7 @@ async function main() {
     if (e.code === 'KeyT') { w.restart(); movementSounds.reset(); if (playing) sounds.play('restart'); $('win').style.display = 'none'; }
     if (e.code === 'KeyH') $('help').classList.toggle('hidden');
     if (e.code === 'KeyM') toggleSound();
-    if (playing && ['KeyR', 'KeyP', 'KeyG', 'KeyF', 'KeyV', 'KeyH'].includes(e.code)) sounds.play('toggle');
+    if (playing && ['KeyR', 'KeyP', 'KeyG', 'KeyQ', 'KeyF', 'KeyV', 'KeyH'].includes(e.code)) sounds.play('toggle');
   });
   addEventListener('keyup', (e) => keys.delete(e.code));
   addEventListener('blur', () => { keys.clear(); sounds.stopAll(); movementSounds.reset(); });
@@ -625,6 +639,7 @@ async function main() {
     device.queue.writeBuffer(primBuf, 0, mem, w.prims_ptr(), np * 4);
 
     const nl = w.light_count();
+    const probes = probeSchedule(frameNo, PROBE_STRIDE);
     device.queue.writeBuffer(lightBuf, 0, mem, w.lights_ptr(), Math.min(nl, MAX_LIGHTS) * 32);
 
     const view = m4.lookAt(eye, target, [0, 1, 0]);
@@ -639,7 +654,7 @@ async function main() {
     uni.set([sun[0], sun[1], sun[2], frameNo], 68);
     uni.set([W, H, rtOn ? 1 : 0, nb], 72);
     uni.set([flash, 1.0, canvas.width, canvas.height], 76);
-    uni.set([rtOn && ptOn ? 1 : 0, 0, 0, 0], 80);
+    uni.set([rtOn && ptOn ? 1 : 0, PROBE_STRIDE, probes.phase, 0], 80);
     uni.set([...(prevEye || eye), 0], 84);
     // random flip / mirror / transpose / offset of each pairing texture, every frame (Sec. 3.2)
     pairTex.forEach((p, s) => uni.set([Math.floor(rand() * 8), Math.floor(rand() * p.size), Math.floor(rand() * p.size), 0], 88 + s * 4));
@@ -676,7 +691,7 @@ async function main() {
     const fwdFlat = norm3([fwd[0], 0, fwd[2]]);
     const pc = add3(target, scale3(fwdFlat, 14));
     uni.set([Math.floor(pc[0] / PROBE_SPACING) - 12, Math.floor(pc[1] / PROBE_SPACING) - 4, Math.floor(pc[2] / PROBE_SPACING) - 16, PROBE_SPACING], 160);
-    uni.set([0.95, frameNo, Math.min(nl, MAX_LIGHTS), 0.1], 164);
+    uni.set([probes.hysteresis, frameNo, Math.min(nl, MAX_LIGHTS), 0.1], 164);
     uni.set([rtOn ? 0 : 1, 1, 1, RASTER_EXPOSURE], 168);
     device.queue.writeBuffer(uniBuf, 0, uni);
     prevVP = vp; prevInvVP = invVP; prevEye = eye;
@@ -731,8 +746,8 @@ async function main() {
     }
     if (!(rtOn && ptOn)) {
       // DDGI probes light both the raster and the hybrid RT modes
-      run(probeTPipe, probeTraceBG, Math.ceil(PROBES / 2 * PRAYS / 64), 1); // trace probe rays
-      run(probeUPipe, probeUpdateBG, PROBES / 2, 1);                        // blend into probes
+      run(probeTPipe, probeTraceBG, Math.ceil(probes.count * PRAYS / 64), 1); // trace probe rays
+      run(probeUPipe, probeUpdateBG, probes.count, 1);                        // blend into probes
     }
     if (rtOn) {
       run(shadePipe, bg.shade);
@@ -791,7 +806,9 @@ async function main() {
       warpSrc = { vp: r.vp, invVP: r.invVP, par: r.par, W, H };
       sceneBusy = false;
       sceneCount++;
-      gpuMs = gpuMs * 0.8 + (performance.now() - t0) * 0.2;
+      const elapsed = performance.now() - t0;
+      gpuMs = gpuMs * 0.8 + elapsed * 0.2;
+      if (autoScale && !SCENE_CAPS[capIdx] && !frozen) observeFrame(elapsed);
     };
     device.queue.onSubmittedWorkDone().then(async () => {
       if (!twoDev) { done(); return; }
@@ -844,7 +861,12 @@ async function main() {
     const dt = Math.min((now - last) / 1000, 0.1); last = now;
     fpsAcc += dt; fpsN++;
     if (fpsAcc > 0.5) { fps = fpsN / fpsAcc; fpsAcc = 0; fpsN = 0; }
-    resize();
+    // Let submitted work finish before replacing an adaptive render target.
+    // Physics and input continue while a slower GPU drains its queue.
+    if (resizePending && !inFlight && !sceneBusy && !warpInFlight) {
+      resize();
+      resizePending = false;
+    }
 
     const k = (c) => (keys.has(c) ? 1 : 0);
     const mz = playing ? k('KeyW') + k('ArrowUp') - k('KeyS') - k('ArrowDown') : 0;
@@ -873,20 +895,25 @@ async function main() {
     }
 
     let nb = lastNb, nl = lastNl;
-    if (!asyncOn) {
+    if (!asyncOn && !resizePending) {
       const r = renderScene(now, eye, target, ctx.getCurrentTexture().createView(), FOV, null);
       nb = r.nb; nl = r.nl;
       inFlight++;
       const t0 = performance.now();
-      device.queue.onSubmittedWorkDone().then(() => { inFlight--; gpuMs = gpuMs * 0.9 + (performance.now() - t0) * 0.1; });
-    } else {
+      device.queue.onSubmittedWorkDone().then(() => {
+        inFlight--;
+        const elapsed = performance.now() - t0;
+        gpuMs = gpuMs * 0.9 + elapsed * 0.1;
+        if (autoScale) observeFrame(elapsed);
+      });
+    } else if (asyncOn) {
       const cap = SCENE_CAPS[capIdx];
-      if (!sceneBusy && !(frozen && warpSrc) && (cap === 0 || now - lastSceneT >= 1000 / cap - 2)) {
+      if (!resizePending && !sceneBusy && !(frozen && warpSrc) && (cap === 0 || now - lastSceneT >= 1000 / cap - 2)) {
         lastSceneT = now;
         const r = startAsyncScene(now, eye, target);
         nb = r.nb; nl = r.nl;
       }
-      presentWarp(eye, target);
+      if (!resizePending) presentWarp(eye, target);
     }
     lastNb = nb; lastNl = nl;
     flash = Math.max(0, flash - dt * 2.5);
@@ -897,9 +924,11 @@ async function main() {
     $('time').textContent = fmtTime(out[12]);
     if (now - sceneT0 > 500) { sceneFps = sceneCount * 1000 / (now - sceneT0); sceneCount = 0; sceneT0 = now; }
     const mode = rtOn ? (ptOn ? 'ReSTIR PT Enhanced' : 'hybrid RT') : `raster GI · ${nl} lights`;
+    const scaleLabel = autoScale ? ` · auto ${Math.round(W / CW * 100)}%` : '';
     $('perf').textContent = asyncOn
       ? `timewarp ${fps.toFixed(0)} fps · ${frozen ? 'FROZEN' : `scene ${sceneFps.toFixed(0)} fps`}${SCENE_CAPS[capIdx] ? ` (cap ${SCENE_CAPS[capIdx]})` : ''} · ${W}×${H} · ${mode}`
       : `${fps.toFixed(0)} fps · ${gpuMs.toFixed(1)} ms · ${W}×${H} · ${nb} boxes · ${mode}`;
+    $('perf').textContent += scaleLabel;
     if (msgTimer > 0) { msgTimer -= dt; if (msgTimer <= 0) $('msg').style.opacity = 0; }
     requestAnimationFrame(tick);
   }
